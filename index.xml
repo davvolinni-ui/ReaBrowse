@@ -1,13 +1,33 @@
 <?xml version="1.0" encoding="utf-8"?>
 <index version="1" name="ReaBrowse" commit="903208ac6fd6d22b7508b4f93492f53a6ec08516">
-<category name="ReaBrowse"><reapack name="ReaBrowse.lua" type="script" desc="ReaBrowse"><metadata><description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+  <category name="ReaBrowse">
+    <reapack name="ReaBrowse.lua" type="script" desc="ReaBrowse">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
 \widowctrl\hyphauto
 
 {\pard \ql \f0 \sa180 \li0 \fi0 ReaBrowse is an audio, MIDI, FX, instrument, and action browser for REAPER. This release supports Windows x64 and requires ReaImGui 0.9 or newer.\par}
 }
-]]></description><link rel="website" href="https://forum.cockos.com/showthread.php?p=2958956#post2958956">Support</link><link rel="website" href="https://github.com/davvolinni-ui/ReaBrowse">GitHub repository</link></metadata><version name="1.0.0-rc1" author="davvolinni-ui" time="2026-08-21T08:02:47Z"><changelog><![CDATA[Initial public release candidate.
-Added full-timeline MIDI display and explicit hanging-note cleanup on Stop.]]></changelog><source main="main" platform="win64">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/ReaBrowse.lua</source><source platform="win64" file="ReaBrowse_Canonical_Schema_v5.sql">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/ReaBrowse_Canonical_Schema_v5.sql</source><source platform="win64" file="sqlite3.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/sqlite3.exe</source><source platform="win64" file="EULA.md">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/EULA.md</source><source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/THIRD_PARTY_NOTICES.md</source><source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source><source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/reaper_reabrowse_native_drag.dll</source></version></reapack></category><metadata><description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+]]></description>
+        <link rel="website" href="https://forum.cockos.com/showthread.php?p=2958956#post2958956">Support</link>
+        <link rel="website" href="https://github.com/davvolinni-ui/ReaBrowse">GitHub repository</link>
+      </metadata>
+      <version name="1.0.0-rc1" author="davvolinni-ui" time="2026-08-21T08:02:47Z">
+        <changelog><![CDATA[Initial public release candidate.
+Added full-timeline MIDI display and explicit hanging-note cleanup on Stop.]]></changelog>
+        <source main="main" platform="win64">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/ReaBrowse.lua</source>
+        <source platform="win64" file="ReaBrowse_Canonical_Schema_v5.sql">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/ReaBrowse_Canonical_Schema_v5.sql</source>
+        <source platform="win64" file="sqlite3.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/sqlite3.exe</source>
+        <source platform="win64" file="EULA.md">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/EULA.md</source>
+        <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
+        <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
+        <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
+      </version>
+    </reapack>
+  </category>
+  <metadata>
+    <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
 \widowctrl\hyphauto
 
@@ -16,10 +36,13 @@ Added full-timeline MIDI display and explicit hanging-note cleanup on Stop.]]></
 {\pard \ql \f0 \sa180 \li0 \fi0 This repository is the official ReaPack distribution source for ReaBrowse.\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Requirements\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Windows x64\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab REAPER\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab ReaPack\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab ReaImGui 0.9 or newer\sa180\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab REAPER 7.0 or newer\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab ReaImGui 0.9 or newer\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab SWS Extension\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab ReaPack (for repository installation)\sa180\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 MIDI audition requires a selected REAPER track containing an instrument.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 The optional js_ReaScriptAPI extension improves native folder selection and mouse/window detection. ReaBrowse falls back to manual folder entry and other available APIs when it is not installed.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 The SQLite helper, database worker, and ReaBrowse native companion DLL are included in the package and do not need to be installed separately.\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Install with ReaPack\par}
 {\pard \ql \f0 \sa180 \li360 \fi-360 1.\tx360\tab In REAPER, open {\b Extensions > ReaPack > Import repositories}.\par}
 {\pard \ql \f0 \sa180 \li360 \fi-360 2.\tx360\tab Import this URL:\par}
@@ -47,4 +70,6 @@ THIRD_PARTY_NOTICES.md
 .\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 This repository does not grant an open-source license to ReaBrowse merely by making its distribution files publicly accessible.\par}
 }
-]]></description></metadata></index>
+]]></description>
+  </metadata>
+</index>
