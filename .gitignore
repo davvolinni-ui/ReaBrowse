@@ -1,0 +1,16 @@
+# ReaPack indexer state
+.reapack-index.log
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+*.user
+*.suo
+*.tmp
+*.bak
+
+# Release files are already compiled; never add build intermediates.
+*.obj
+*.lib
+*.exp
+*.pdb

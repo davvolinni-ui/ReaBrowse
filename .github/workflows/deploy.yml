@@ -1,0 +1,34 @@
+name: Update ReaPack index
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  reapack-index:
+    if: ${{ !contains(github.event.head_commit.message, '[ci skip]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure git
+        run: |
+          git config user.name "ReaBrowse Index Bot"
+          git config user.email "actions@users.noreply.github.com"
+      - name: Install Pandoc
+        run: sudo apt-get update && sudo apt-get install -yy pandoc
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+      - name: Install reapack-index
+        run: gem install reapack-index
+      - name: Update index.xml
+        run: reapack-index --commit
+      - name: Push index update
+        run: git push
