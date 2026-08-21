@@ -1,5 +1,5 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc2
+-- @version 1.0.0-rc3
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
@@ -9,8 +9,10 @@
 --   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
 --   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Fixed Control Transport MIDI handoffs cutting off opening notes.
---   Preserved explicit hanging-note cleanup on Stop.
+--   Improved MIDI and audio preview handoffs during transport playback.
+--   Fixed database reset and post-reset library scanning without a relaunch.
+--   Added a safe fallback when background discovery is unavailable.
+--   Cleared Favorite hearts immediately after Clear All Favorites.
 -- @metapackage
 -- @provides
 --   [win64 main] .
@@ -662,6 +664,7 @@ local state = {
         discovery_progress_path = nil,
         discovery_file = nil,
         discovery_nodes = nil,
+        discovery_worker_unready_since = nil,
     },
     library_cache_save = {
         active = false,
@@ -3487,9 +3490,13 @@ function PreserveCanonicalUserDataForReset(database_path)
         "detected_key_pc,created_at,updated_at FROM key_overrides;",
         "DETACH DATABASE preserved;",
     })
-    local _, err = QueryDatabaseScalarAtPath(
-        database_path, backup_sql, 120000)
-    if err then
+    -- This is a multi-statement write, not a scalar query. Passing the whole
+    -- preservation program on the Windows process command line is fragile
+    -- (and can fail before SQLite sees it). Use the established batch-file
+    -- writer so quoting and command length are independent of user-data size.
+    local preserved, err = WriteDatabaseBatch(
+        backup_sql, nil, database_path)
+    if not preserved then
         pcall(os.remove, backup_path)
         return false, err
     end
@@ -3804,13 +3811,13 @@ local function DeleteCanonicalLibraryDatabase(factory_reset)
     if database.worker_started then
         CloseMediaDatabase()
         database.status =
-            "Database worker is shutting down; click Delete Database again."
+            "Worker stopping - click Delete Database again."
         return false
     end
     if database.worker_queue
         and FileExists(database.worker_queue .. "/worker.ready") then
         database.status =
-            "Database worker is still shutting down; try again shortly."
+            "Worker still stopping - try again shortly."
         return false
     end
     CloseMediaDatabase()
@@ -3884,7 +3891,9 @@ local function DeleteCanonicalLibraryDatabase(factory_reset)
     state.canonical_browser.favorite_scope_upper_bounds = {}
     state.canonical_browser.available_tags = {}
     state.canonical_browser.error = nil
-    state.canonical_browser.status = "Library reset. Restart to add folders again."
+    state.canonical_browser.status = factory_reset
+        and "Factory reset complete; restart ReaBrowse."
+        or "Library reset; preparing an empty database..."
     state.canonical_browser.loading = false
     state.canonical_browser.smart_mode = nil
     state.canonical_browser.collection_key = nil
@@ -4028,7 +4037,15 @@ local function DeleteCanonicalLibraryDatabase(factory_reset)
     state.database_startup_test.enabled = false
     database.status = factory_reset
         and "Factory reset complete; restart ReaBrowse."
-        or "Library reset; restart ReaBrowse to add folders again."
+        or "Library reset; preparing an empty database..."
+    if not factory_reset then
+        -- Reuse the normal deferred startup path to recreate schema v5,
+        -- restore the preserved user-data backup, and launch a fresh worker.
+        -- Root controls remain disabled only for these initialization frames
+        -- and no ReaBrowse/REAPER relaunch is required.
+        state.lazy_init_frame = 0
+        state.lazy_init_pending = true
+    end
     return removed or not FileExists(target)
 end
 
@@ -11005,6 +11022,35 @@ function QueueCanonicalClearFavorites()
     return QueueCanonicalUserDataSQL(sql, "favorites_clear")
 end
 
+function ClearFavoriteSessionState()
+    -- Keep false overrides for every favorite known to this session. Loaded
+    -- Library/result rows can retain a canonical favorite decoration until
+    -- they are rebuilt; the override makes those stale row flags resolve as
+    -- cleared immediately without invalidating unrelated browser data.
+    local overrides = state.favorite_pending_overrides or {}
+    for key in pairs(overrides) do overrides[key] = false end
+    for _, entry in ipairs(state.favorites or {}) do
+        local key = NormalizeFavoritePath(entry.path)
+        if key ~= "" then overrides[key] = false end
+    end
+    for key in pairs(state.favorite_mutation_pending or {}) do
+        overrides[key] = false
+    end
+    for _, mutation in ipairs(state.favorite_mutation_inflight or {}) do
+        local key = NormalizeFavoritePath(mutation.path)
+        if key ~= "" then overrides[key] = false end
+    end
+    state.favorite_pending_overrides = overrides
+
+    -- A deferred favorite lookup must not re-apply an older click after the
+    -- clear. The database clear is already queued after prior user writes;
+    -- this only retires their unfinished in-memory decoration work.
+    state.favorite_mutation_pending = {}
+    state.favorite_mutation_inflight = {}
+    state.favorite_mutation_versions = {}
+    state.favorite_mutation_next_frame = 0
+end
+
 function QueueCanonicalPruneMissingFavorites()
     local sql = ""
         .. "DELETE FROM collection_items WHERE file_id IN"
@@ -14202,6 +14248,16 @@ function StartWorkerLibraryDiscovery(paths)
     if not EnsureDatabaseWorkerStarted(GetCanonicalDatabasePath()) then
         return false
     end
+    -- worker_started means launch was requested, not that the process opened
+    -- and validated the new database. Publishing discovery before worker.ready
+    -- can orphan the request if a concurrent startup page falls back to SQLite.
+    -- Use the incremental Lua scanner for this update; a later update can use
+    -- the warmed worker once its heartbeat is confirmed.
+    if not IsDatabaseWorkerReady() then
+        database.worker_status =
+            "Database worker is still starting; using incremental discovery."
+        return false
+    end
     local queue = database.worker_queue
     if not queue then return false end
     if r.RecursiveCreateDirectory then r.RecursiveCreateDirectory(queue, 0) end
@@ -14242,6 +14298,7 @@ function StartWorkerLibraryDiscovery(paths)
     scan.discovery_output_path = output_path
     scan.discovery_progress_path = output_path .. ".progress"
     scan.discovery_nodes = {}
+    scan.discovery_worker_unready_since = nil
     for _, root in ipairs(scan.roots or {}) do
         scan.discovery_nodes[NormalizeFavoritePath(root.path)] = root
     end
@@ -14251,11 +14308,53 @@ function StartWorkerLibraryDiscovery(paths)
     return true
 end
 
+local function FallBackFromWorkerLibraryDiscovery(detail)
+    local scan = state.library_scan
+    if scan.discovery_request_path then
+        local cancel = io.open(scan.discovery_request_path .. ".cancel", "wb")
+        if cancel then cancel:write("worker unavailable\n"); cancel:close() end
+        pcall(os.remove, scan.discovery_request_path)
+    end
+    pcall(os.remove, scan.discovery_result_path)
+    pcall(os.remove, scan.discovery_output_path)
+    pcall(os.remove, scan.discovery_output_path
+        and (scan.discovery_output_path .. ".writing") or nil)
+    pcall(os.remove, scan.discovery_progress_path)
+    scan.discovery_request_path = nil
+    scan.discovery_result_path = nil
+    scan.discovery_output_path = nil
+    scan.discovery_progress_path = nil
+    scan.discovery_nodes = nil
+    scan.discovery_worker_unready_since = nil
+    scan.phase = "folders"
+    scan.phase_label = "Discovering folders"
+    scan.phase_detail = detail
+        or "Background discovery unavailable; using incremental discovery"
+    scan.queue_index = 1
+    scan.current = nil
+end
+
 function PollWorkerLibraryDiscovery()
     local scan = state.library_scan
     local result = scan.discovery_result_path
         and io.open(scan.discovery_result_path, "rb")
     if not result then
+        if IsDatabaseWorkerReady() then
+            scan.discovery_worker_unready_since = nil
+        else
+            local now = r.time_precise()
+            scan.discovery_worker_unready_since =
+                scan.discovery_worker_unready_since or now
+            if now - scan.discovery_worker_unready_since >= 3 then
+                state.database.worker_started = false
+                state.database.worker_started_at = nil
+                state.database.worker_status =
+                    "Discovery worker stopped; using incremental discovery."
+                FallBackFromWorkerLibraryDiscovery(
+                    "Background worker stopped; continuing in ReaBrowse")
+                return
+            end
+        end
         local progress = scan.discovery_progress_path
             and io.open(scan.discovery_progress_path, "rb")
         if progress then
@@ -14279,13 +14378,8 @@ function PollWorkerLibraryDiscovery()
     local _, status, _, payload = response:match(
         "^([^\t]*)\t([^\t]*)\t([^\t]*)\t?(.*)$")
     if status ~= "ok" then
-        pcall(os.remove, scan.discovery_output_path)
-        pcall(os.remove, scan.discovery_progress_path)
-        scan.phase = "folders"
-        scan.phase_label = "Discovering folders"
-        scan.phase_detail = "Background discovery failed; using Lua fallback"
-        scan.queue_index = 1
-        scan.current = nil
+        FallBackFromWorkerLibraryDiscovery(
+            "Background discovery failed; using incremental discovery")
         return
     end
     local folders, files = DecodeWorkerPayload(payload):match(
@@ -14540,6 +14634,7 @@ function CancelLibraryScan()
     scan.discovery_output_path = nil
     scan.discovery_progress_path = nil
     scan.discovery_nodes = nil
+    scan.discovery_worker_unready_since = nil
     scan.scanning = false
     scan.phase = nil
     scan.browser_blocked = false
@@ -16271,6 +16366,10 @@ function LoadBrowserFile(filepath, classification, start_immediately)
         return LoadMIDIFile(filepath, classification, start_immediately)
     end
     if IsAudioFile(filepath) then
+        -- The deferred transport restart is MIDI-only.  If the user selects
+        -- audio during that short window, cancel the MIDI restart so it
+        -- cannot suppress or replace the audio preview.
+        state.pending_control_transport_restart_at = nil
         return LoadAudioFile(filepath, classification)
     end
     return false
@@ -18869,7 +18968,15 @@ function DrawSettingsPopup()
             state.database.backend == "sqlite"
                 and GetMediaDatabasePath()
                 or "Library browsing and updates require SQLite.")
-        imgui.TextDisabled(ctx, state.database.status or "")
+        local database_status = state.database.status or ""
+        local status_belongs_to_maintenance =
+            database_status:match("^Worker ") ~= nil
+            or database_status:match("^Library database") ~= nil
+            or database_status:match("^Library reset") ~= nil
+            or database_status:match("^Factory reset") ~= nil
+        if database_status ~= "" and not status_belongs_to_maintenance then
+            imgui.TextDisabled(ctx, database_status)
+        end
         local sync = state.canonical_scan_sync
         imgui.Spacing(ctx)
         imgui.Text(ctx, "Scan")
@@ -19003,6 +19110,9 @@ function DrawSettingsPopup()
                 "Deletes only ReaBrowse's generated database and cache.\n"
                 .. "Your audio and MIDI files are not touched.")
         end
+        if status_belongs_to_maintenance then
+            imgui.TextDisabled(ctx, database_status)
+        end
         if imgui.Button(ctx, "Factory Reset...", 160, 0) then
             imgui.OpenPopup(ctx, "Factory Reset ReaBrowse?")
         end
@@ -19055,9 +19165,9 @@ function DrawSettingsPopup()
         if imgui.BeginPopup(ctx, "Delete Library Database?") then
             imgui.Text(ctx, "Delete the ReaBrowse library database?")
             imgui.TextDisabled(ctx,
-                "Configured folders are cleared. ReaBrowse never deletes source media."
-                    .. " Favorites, custom folders, and user tags are preserved"
-                    .. " and restored after the next scan. Restart to add folders again.")
+                "Clears configured folders and generated library data; keeps Favorites"
+                    .. " and user tags.\nSource media is untouched."
+                    .. " An empty database is rebuilt automatically.")
             if imgui.Button(ctx, "Delete Database", 140, 0) then
                 DeleteCanonicalLibraryDatabase()
                 imgui.CloseCurrentPopup(ctx)
@@ -19098,6 +19208,7 @@ function DrawSettingsPopup()
             imgui.Text(ctx, "Remove every favorite and Favorites folder?")
             imgui.TextDisabled(ctx, "Source files are never deleted.")
             if imgui.Button(ctx, "Clear") then
+                ClearFavoriteSessionState()
                 state.favorites = {}
                 state.favorite_index = {}
                 state.favorite_index_dirty = false
