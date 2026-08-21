@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="ReaBrowse" commit="903208ac6fd6d22b7508b4f93492f53a6ec08516">
+<index version="1" name="ReaBrowse" commit="e98302220b98c328e093a2b5a12578eb438902da">
   <category name="ReaBrowse">
     <reapack name="ReaBrowse.lua" type="script" desc="ReaBrowse">
       <metadata>
@@ -7,7 +7,7 @@
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
 \widowctrl\hyphauto
 
-{\pard \ql \f0 \sa180 \li0 \fi0 ReaBrowse is an audio, MIDI, FX, instrument, and action browser for REAPER. This release supports Windows x64 and requires ReaImGui 0.9 or newer.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 ReaBrowse is an audio, MIDI, FX, instrument, and action browser for REAPER. Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer, and the SWS Extension for full arrange-view drag-and-drop support.\par}
 }
 ]]></description>
         <link rel="website" href="https://forum.cockos.com/showthread.php?p=2958956#post2958956">Support</link>
@@ -23,6 +23,17 @@ Added full-timeline MIDI display and explicit hanging-note cleanup on Stop.]]></
         <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
         <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
         <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/903208ac6fd6d22b7508b4f93492f53a6ec08516/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
+      </version>
+      <version name="1.0.0-rc2" author="davvolinni-ui" time="2026-08-21T09:07:06Z">
+        <changelog><![CDATA[Fixed Control Transport MIDI handoffs cutting off opening notes.
+Preserved explicit hanging-note cleanup on Stop.]]></changelog>
+        <source main="main" platform="win64">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/ReaBrowse.lua</source>
+        <source platform="win64" file="ReaBrowse_Canonical_Schema_v5.sql">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/ReaBrowse_Canonical_Schema_v5.sql</source>
+        <source platform="win64" file="sqlite3.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/sqlite3.exe</source>
+        <source platform="win64" file="EULA.md">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/EULA.md</source>
+        <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
+        <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
+        <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
       </version>
     </reapack>
   </category>
@@ -51,7 +62,7 @@ Added full-timeline MIDI display and explicit hanging-note cleanup on Stop.]]></
 {\pard \ql \f0 \sa180 \li360 \fi-360 4.\tx360\tab Find and install {\b ReaBrowse}.\par}
 {\pard \ql \f0 \sa180 \li360 \fi-360 5.\tx360\tab Restart REAPER so the native companion extension is loaded.\par}
 {\pard \ql \f0 \sa180 \li360 \fi-360 6.\tx360\tab Open the Action List and run {\b ReaBrowse}.\sa180\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 ReaPack installs the main script and runtime files under {\f1 Scripts/ReaBrowse} and the native companion under {\f1 UserPlugins}.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 ReaPack installs the main script and runtime files under {\f1 Scripts/ReaBrowse/ReaBrowse} and the native companion under {\f1 UserPlugins}.\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Release status\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 The current package is a release candidate. Back up important REAPER settings and project data before testing prerelease software.\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Support\par}
