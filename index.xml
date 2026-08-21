@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="ReaBrowse" commit="e98302220b98c328e093a2b5a12578eb438902da">
+<index version="1" name="ReaBrowse" commit="a43cf428006822c0b1053d1bb36a56d30c898040">
   <category name="ReaBrowse">
     <reapack name="ReaBrowse.lua" type="script" desc="ReaBrowse">
       <metadata>
@@ -34,6 +34,19 @@ Preserved explicit hanging-note cleanup on Stop.]]></changelog>
         <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
         <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
         <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/e98302220b98c328e093a2b5a12578eb438902da/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
+      </version>
+      <version name="1.0.0-rc3" author="davvolinni-ui" time="2026-08-21T11:10:04Z">
+        <changelog><![CDATA[Improved MIDI and audio preview handoffs during transport playback.
+Fixed database reset and post-reset library scanning without a relaunch.
+Added a safe fallback when background discovery is unavailable.
+Cleared Favorite hearts immediately after Clear All Favorites.]]></changelog>
+        <source main="main" platform="win64">https://github.com/davvolinni-ui/ReaBrowse/raw/a43cf428006822c0b1053d1bb36a56d30c898040/ReaBrowse/ReaBrowse.lua</source>
+        <source platform="win64" file="ReaBrowse_Canonical_Schema_v5.sql">https://github.com/davvolinni-ui/ReaBrowse/raw/a43cf428006822c0b1053d1bb36a56d30c898040/ReaBrowse/ReaBrowse_Canonical_Schema_v5.sql</source>
+        <source platform="win64" file="sqlite3.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/a43cf428006822c0b1053d1bb36a56d30c898040/ReaBrowse/sqlite3.exe</source>
+        <source platform="win64" file="EULA.md">https://github.com/davvolinni-ui/ReaBrowse/raw/a43cf428006822c0b1053d1bb36a56d30c898040/ReaBrowse/EULA.md</source>
+        <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/a43cf428006822c0b1053d1bb36a56d30c898040/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
+        <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/a43cf428006822c0b1053d1bb36a56d30c898040/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
+        <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/a43cf428006822c0b1053d1bb36a56d30c898040/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
       </version>
     </reapack>
   </category>
