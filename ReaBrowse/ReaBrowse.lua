@@ -1,15 +1,16 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc1
+-- @version 1.0.0-rc2
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
 --   GitHub repository https://github.com/davvolinni-ui/ReaBrowse
 -- @about
 --   ReaBrowse is an audio, MIDI, FX, instrument, and action browser for REAPER.
---   This release supports Windows x64 and requires ReaImGui 0.9 or newer.
+--   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
+--   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Initial public release candidate.
---   Added full-timeline MIDI display and explicit hanging-note cleanup on Stop.
+--   Fixed Control Transport MIDI handoffs cutting off opening notes.
+--   Preserved explicit hanging-note cleanup on Stop.
 -- @metapackage
 -- @provides
 --   [win64 main] .
@@ -598,6 +599,7 @@ local state = {
     pending_audio_handoff_position = nil,
     pending_audio_start_from_seek = false,
     pending_audio_phase_sync_frames = 0,
+    pending_control_transport_restart_at = nil,
     audio_volume_db = 0,
     -- Direct output keeps browser preview outside REAPER's track/master PDC
     -- path. Track routing remains available as an explicit opt-in.
@@ -15487,6 +15489,24 @@ function StartPreparedLinkedTransport(prepared)
     if prepared then r.CSurf_OnPlay() end
 end
 
+function GetControlTransportRestartDelay()
+    local function ReadDeviceNumber(attribute)
+        if not r.GetAudioDeviceInfo then return nil end
+        local ok, first, second = pcall(r.GetAudioDeviceInfo, attribute)
+        if not ok then return nil end
+        local value = type(first) == "string" and first or second
+        value = tonumber(value)
+        return value and value > 0 and value or nil
+    end
+    local block_size = ReadDeviceNumber("BSIZE")
+    local sample_rate = ReadDeviceNumber("SRATE")
+    if not block_size or not sample_rate then return 0.10 end
+    -- Leave two complete device blocks plus a small scheduling margin between
+    -- REAPER's transport stop cleanup and the replacement preview.
+    return math.max(0.06, math.min(0.25,
+        block_size / sample_rate * 2 + 0.03))
+end
+
 -- Keep the audio playback policy in one place.  Classification and the MX
 -- tuner/key path remain separate; this only prevents one-shot audio from
 -- accidentally inheriting loop/tempo behavior in one of the UI paths.
@@ -16167,7 +16187,7 @@ function LoadAudioFile(filepath, classification)
     return true
 end
 
-function LoadMIDIFile(filepath, classification)
+function LoadMIDIFile(filepath, classification, start_immediately)
     if not FileExists(filepath) then return false end
     ReleaseLoadedAudioSource()
     local parsed, err = ParseStandardMIDIFile(filepath)
@@ -16176,11 +16196,21 @@ function LoadMIDIFile(filepath, classification)
         return false
     end
 
+    -- Keep an active native MIDI voice registered when this selection will
+    -- immediately replace it. StartNativePreview serializes that direct
+    -- MIDI-to-MIDI handoff before the incoming opening notes are emitted.
+    -- Stopping here would instead retire the old source for asynchronous
+    -- cleanup; its delayed all-notes-off could then cut the new first chord.
+    local preserve_native_midi_handoff = start_immediately == true
+        and state.is_playing
+        and state.audio_preview_native
+        and state.native_preview_kind == "midi"
+
     state.source_file = filepath
     state.media_kind = "midi"
     state.current_media_class = ResolveEffectiveMediaClass(
         filepath, classification)
-    StopAudioPreview()
+    if not preserve_native_midi_handoff then StopAudioPreview() end
     state.preview_setup_message = nil
     state.audio_peaks = nil
     state.audio_detected_key_pc = nil
@@ -16224,14 +16254,22 @@ function LoadMIDIFile(filepath, classification)
     state.loaded_midi.detected_key_pc = ResolveEffectiveKeyPitchClass(
         filepath, state.loaded_midi.automatic_key_pc)
 
-    ApplyPlaybackSettings()
+    -- The immediate StartPreview call installs the replacement configuration.
+    -- Do not apply the new file's timing to the outgoing voice during the
+    -- small direct-handoff window.
+    if not preserve_native_midi_handoff then ApplyPlaybackSettings() end
     return true
 end
 
-function LoadBrowserFile(filepath, classification)
+function LoadBrowserFile(filepath, classification, start_immediately)
+    if start_immediately ~= true then
+        state.pending_control_transport_restart_at = nil
+    end
     state.preview_seek_fraction = 0
     state.preview_sync_phase_offset_fraction = 0
-    if IsMidiFile(filepath) then return LoadMIDIFile(filepath, classification) end
+    if IsMidiFile(filepath) then
+        return LoadMIDIFile(filepath, classification, start_immediately)
+    end
     if IsAudioFile(filepath) then
         return LoadAudioFile(filepath, classification)
     end
@@ -16361,6 +16399,26 @@ function SetAudioRoute(mode, output_channel, mono)
 end
 
 function StartPreview()
+    if state.pending_control_transport_restart_at then return end
+    if state.media_kind == "midi" and PreviewControlsTransport()
+        and MIDITransportModeApplies() then
+        local play_state = r.GetPlayState()
+        if (play_state & 1) ~= 0 and (play_state & 4) == 0 then
+            -- REAPER's transport stop sends a track-wide MIDI reset. Starting
+            -- the replacement preview and transport in this same UI frame lets
+            -- that reset arrive after its first note-ons. Complete the stop
+            -- first; Loop() starts only the latest selected file after two
+            -- audio blocks have drained.
+            StopAudioPreview()
+            state.is_playing = false
+            r.CSurf_OnStop()
+            r.SetEditCurPos(0, false, false)
+            state.pending_control_transport_restart_at = r.time_precise()
+                + GetControlTransportRestartDelay()
+            state.preview_setup_message = "Preparing MIDI transport..."
+            return
+        end
+    end
     if state.media_kind == "audio" then
         if not state.source_file or state.source_file == "" then
             state.preview_setup_message = "No audio file is selected."
@@ -16591,6 +16649,7 @@ function StartPreview()
         end
         state.native_companion_version = native_version
         if native_version < 5 then
+            StopAudioPreview()
             state.is_playing = false
             state.preview_setup_message =
                 "MIDI preview requires ReaBrowse native companion v5."
@@ -16598,6 +16657,7 @@ function StartPreview()
         end
         local output_track = r.GetSelectedTrack(0, 0)
         if not output_track then
+            StopAudioPreview()
             state.is_playing = false
             state.preview_setup_message =
                 "Select the instrument track for native MIDI preview."
@@ -16605,6 +16665,7 @@ function StartPreview()
         end
         if type(r.ReaBrowse_ConfigureNativePreview) ~= "function"
             or type(r.ReaBrowse_StartNativePreview) ~= "function" then
+            StopAudioPreview()
             state.is_playing = false
             state.preview_setup_message =
                 "The native MIDI preview API is unavailable."
@@ -16617,6 +16678,7 @@ function StartPreview()
         local linked_transport_prepared =
             PrepareLinkedTransportStart(PreviewControlsTransport())
         if PreviewControlsTransport() and linked_transport_prepared == nil then
+            StopAudioPreview()
             state.is_playing = false
             state.preview_setup_message =
                 "Linked transport is unavailable while recording."
@@ -16674,6 +16736,7 @@ function StartPreview()
             transport_loop, transport_loop_start_s,
             transport_loop_end_s, transport_loop_length_qn)
         if r.ReaBrowse_ConfigureNativePreview(sync_spec) ~= 1 then
+            StopAudioPreview()
             state.is_playing = false
             state.preview_setup_message =
                 "Native MIDI configuration failed."
@@ -16686,6 +16749,7 @@ function StartPreview()
             loop_midi and 1 or 0, 1.0, 0,
             output_track, project)
         if played ~= 1 and played ~= true then
+            StopAudioPreview()
             state.is_playing = false
             state.preview_setup_message =
                 "REAPER could not start native MIDI preview."
@@ -16707,6 +16771,7 @@ function StartPreview()
 end
 
 function StopPreview(skip_linked_transport_stop)
+    state.pending_control_transport_restart_at = nil
     local stop_linked_transport = not skip_linked_transport_stop
         and PreviewControlsTransport()
         and ((state.media_kind == "audio"
@@ -18028,7 +18093,8 @@ function SetCursorToFileNode(node, ensure_visible, row_key)
     state.cursor_type = "file"
     state.selected_path = node.path
     state.scroll_to_cursor = ensure_visible == true
-    LoadBrowserFile(node.path, state.current_media_class)
+    LoadBrowserFile(node.path, state.current_media_class,
+        state.auto_play == true)
     if state.auto_play then StartPreview() end
 end
 
@@ -18052,7 +18118,7 @@ function PlayFile(filepath)
     else
         state.pending_audio_handoff_position = nil
     end
-    if state.selected_path ~= filepath then LoadBrowserFile(filepath) end
+    if state.selected_path ~= filepath then LoadBrowserFile(filepath, nil, true) end
     StartPreview()
 end
 
@@ -24205,6 +24271,9 @@ function DrawMIDIPreview()
     if CompactToggle(
         "autoplay", "A", "Auto Play", state.auto_play, 28) then
         state.auto_play = not state.auto_play
+        if not state.auto_play then
+            state.pending_control_transport_restart_at = nil
+        end
         SavePreviewPreferences("auto_play")
     end
     imgui.SameLine(ctx)
@@ -29495,6 +29564,11 @@ function Loop()
             -- per-frame extension calls on high-refresh displays.
             state.audio_waveform_poll_at = now + 0.03
         end
+    end
+    local pending_restart_at = state.pending_control_transport_restart_at
+    if pending_restart_at and r.time_precise() >= pending_restart_at then
+        state.pending_control_transport_restart_at = nil
+        StartPreview()
     end
     local transport_running = (r.GetPlayState() & 1) ~= 0
     local transport_started =

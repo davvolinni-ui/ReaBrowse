@@ -35,7 +35,8 @@ included in the package and do not need to be installed separately.
 5. Restart REAPER so the native companion extension is loaded.
 6. Open the Action List and run **ReaBrowse**.
 
-ReaPack installs the main script and runtime files under `Scripts/ReaBrowse` and the native companion under `UserPlugins`.
+ReaPack installs the main script and runtime files under
+`Scripts/ReaBrowse/ReaBrowse` and the native companion under `UserPlugins`.
 
 ## Release status
 
