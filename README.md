@@ -7,11 +7,19 @@ This repository is the official ReaPack distribution source for ReaBrowse.
 ## Requirements
 
 - Windows x64
-- REAPER
-- ReaPack
+- REAPER 7.0 or newer
 - ReaImGui 0.9 or newer
+- SWS Extension
+- ReaPack (for repository installation)
 
 MIDI audition requires a selected REAPER track containing an instrument.
+
+The optional js_ReaScriptAPI extension improves native folder selection and
+mouse/window detection. ReaBrowse falls back to manual folder entry and other
+available APIs when it is not installed.
+
+The SQLite helper, database worker, and ReaBrowse native companion DLL are
+included in the package and do not need to be installed separately.
 
 ## Install with ReaPack
 
