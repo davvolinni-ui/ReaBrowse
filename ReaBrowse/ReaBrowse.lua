@@ -21081,6 +21081,7 @@ local function CaptureBrowserRowInteraction(row_key)
         interaction.active = false
         interaction.double_clicked = false
         interaction.right_clicked = false
+        interaction.middle_clicked = false
         interaction.ctrl = false
         interaction.shift = false
         interaction.row_key = row_key
@@ -21095,6 +21096,7 @@ local function CaptureBrowserRowInteraction(row_key)
     interaction.double_clicked = hovered
         and imgui.IsMouseDoubleClicked(ctx, 0)
     interaction.right_clicked = hovered and imgui.IsMouseClicked(ctx, 1)
+    interaction.middle_clicked = hovered and imgui.IsMouseClicked(ctx, 2)
     interaction.ctrl = ctrl
     interaction.shift = shift
     interaction.row_key = row_key
@@ -21164,6 +21166,19 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
         end
         if interaction.double_clicked then
             InsertFileFromBrowserDoubleClick(filepath)
+        end
+    end
+
+    -- One middle-click provides both Cartridge actions: target the currently
+    -- open Cartridge interface when one exists, otherwise create a new one.
+    -- Keep this independent from left-click selection and drag handling.
+    if not suppress_click and interaction.middle_clicked
+        and IsAudioFile(filepath) then
+        local cartridge_track = FindActiveCartridge()
+        if cartridge_track then
+            LoadFileIntoActiveCartridge(filepath)
+        else
+            OpenFileInNewCartridge(filepath)
         end
     end
     
