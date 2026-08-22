@@ -1,5 +1,5 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc3
+-- @version 1.0.0-rc4
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
@@ -9,10 +9,8 @@
 --   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
 --   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Improved MIDI and audio preview handoffs during transport playback.
---   Fixed database reset and post-reset library scanning without a relaunch.
---   Added a safe fallback when background discovery is unavailable.
---   Cleared Favorite hearts immediately after Clear All Favorites.
+--   Added smart Cartridge middle-click loading: loads into an open Cartridge,
+--   or creates a new Cartridge when none is active.
 -- @metapackage
 -- @provides
 --   [win64 main] .
