@@ -1,5 +1,5 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc4
+-- @version 1.0.0-rc5
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
@@ -9,8 +9,13 @@
 --   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
 --   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Added smart Cartridge middle-click loading: loads into an open Cartridge,
---   or creates a new Cartridge when none is active.
+--   Fixed Favorites root/custom-folder ownership across add, remove, copy,
+--   move, folder deletion, overlapping roots, and Library heart rendering.
+--   Kept Favorites search and structured-filter results visible when a file
+--   or the blank result area is selected.
+--   Improved Random performance and scope handling for Favorites root,
+--   custom folders, physical folders, Recent, and Most Used.
+--   Fixed clipped ReaImGui child panels causing duplicate EndChild calls.
 -- @metapackage
 -- @provides
 --   [win64 main] .
@@ -45,6 +50,7 @@ local SCRIPT_START_TIME = r.time_precise()
 local GetLibraryScanProgress
 local DrawLibraryScanProgressPanel
 local SQLQuote
+local EnsureFavoriteIndex
 
 -- ============================================================
 -- LOAD REAIMGUI
@@ -4218,6 +4224,10 @@ local function ParseCanonicalPageRows(output, page_size)
                 -- Keep the 63-bit SQLite key as text. Lua numbers cannot
                 -- represent every INTEGER value exactly enough for a cursor.
                 random_key = fields[8] ~= "" and fields[8] or nil,
+                -- Loose Favorites-root pages append the file's custom-folder
+                -- ownership. Hydrating that bounded page prevents removing
+                -- root ownership from temporarily clearing the global heart.
+                favorite_collection_keys = fields[9] or "",
             }
             if row.kind == "F" and (row.classification == "loop"
                 or row.classification == "one-shot"
@@ -4332,7 +4342,15 @@ local function BuildCanonicalUnifiedMatchCTE(
             .. SQLQuote(scoped_collection_key) .. "))"
         local scope_count = GetCanonicalFavoriteScopeCount(
             scoped_collection_key)
-        if scope_count and scope_count <= SMALL_MATERIALIZED_FOLDER_SCOPE then
+        if minimum_random_key_sql
+            or (scope_count
+                and scope_count <= SMALL_MATERIALIZED_FOLDER_SCOPE) then
+            -- Organizational Favorites folders are normally sparse compared
+            -- with the Library. Walking the global random-key index and running
+            -- two membership probes for every file made a five-item collection
+            -- scan hundreds of thousands of unrelated rows. Random requests
+            -- materialize the selected collection first, then sort only that
+            -- bounded membership by random_key.
             ctes[#ctes + 1] =
                 "collection_files(file_id) AS MATERIALIZED (SELECT "
                 .. "collection_items.file_id FROM collection_items JOIN "
@@ -4791,6 +4809,19 @@ local function StartCanonicalPageQuery(
                 .. "collection_items.folder_id WHERE collection_items.folder_id "
                 .. "IS NOT NULL),0);\n"
         end
+    elseif mode == "favorite_scope_count" then
+        -- Resolve the small/materialized versus large/streaming plan before
+        -- Root Random starts. Embedding both paths behind a SQL OR prevents
+        -- SQLite from optimizing either path and makes even a tiny uncached
+        -- Favorites set walk the global random stream.
+        sql[#sql + 1] =
+            "SELECT 'S',(SELECT count(*) FROM user_file_data WHERE "
+            .. "favorite=1)+(SELECT count(*) FROM collection_items WHERE "
+            .. "file_id IS NOT NULL)+COALESCE((SELECT sum("
+            .. "folder_subtree_stats.file_count) FROM collection_items "
+            .. "JOIN folder_subtree_stats ON folder_subtree_stats.folder_id="
+            .. "collection_items.folder_id WHERE collection_items.folder_id "
+            .. "IS NOT NULL),0);\n"
     elseif mode == "smart_favorites" then
         local browser = state.canonical_browser
         local favorite_sort = state.favorite_sort or "added"
@@ -4811,8 +4842,9 @@ local function StartCanonicalPageQuery(
             and (tonumber(browser.key_pc) or -1) < 0
         local matched
         if unfiltered_favorites then
-            -- All Favorites is the flat file overview; Favorites Library owns
-            -- the folder hierarchy. Unfiltered, show only files with their own
+            -- This legacy aggregate query is retained for compatibility, but
+            -- the current Favorites UI opens the Favorites Library hierarchy.
+            -- Unfiltered, show only files with their own
             -- root/custom membership. Descendants inherited from a favorited
             -- folder remain available inside that folder and to search/filter/
             -- random, but do not flood this list as standalone rows.
@@ -4897,7 +4929,12 @@ local function StartCanonicalPageQuery(
             .. "FROM user_file_data WHERE user_file_data.file_id="
             .. "direct_file_ids.file_id),0) FROM direct_file_ids) SELECT 'F',"
             .. "files.id,hex(files.name),hex(files.canonical_path),files.media_type,0,"
-            .. "files.classification FROM direct_files JOIN files ON files.id="
+            .. "files.classification,0 AS reserved,'M'||COALESCE((SELECT "
+            .. "group_concat(hex(collection_external_keys.external_key),',') "
+            .. "FROM collection_items JOIN collection_external_keys ON "
+            .. "collection_external_keys.collection_id="
+            .. "collection_items.collection_id WHERE collection_items.file_id="
+            .. "files.id),'') FROM direct_files JOIN files ON files.id="
             .. "direct_files.file_id WHERE files.missing=0 ORDER BY "
             .. item_order .. " LIMIT " .. tostring(limit)
             .. " OFFSET " .. tostring(offset) .. ";\n"
@@ -5638,6 +5675,43 @@ local function ApplyCanonicalAccordionPage(page, append, target)
                 node._canonical_favorite = true
             elseif target.is_favorite_root_files then
                 node._canonical_favorite = true
+                node._favorite_root_membership = true
+                -- Direct loose files are intentionally absent from the startup
+                -- cache for scalability. The root page is bounded, so hydrate
+                -- the complete ownership of each visible row here. A later
+                -- root-only removal can then preserve custom-folder ownership
+                -- (and the Library heart) without a synchronous database read.
+                EnsureFavoriteIndex()
+                local favorite_key = NormalizeFavoritePath(node.path or "")
+                local favorite_index = state.favorite_index[favorite_key]
+                local favorite_entry = favorite_index
+                    and state.favorites[favorite_index] or nil
+                if not favorite_entry then
+                    favorite_entry = {
+                        kind = "file", path = node.path,
+                        added = 0, collection_ids = {},
+                        _direct_favorite = true,
+                    }
+                    AddCanonicalFavoriteCacheEntry(favorite_entry)
+                else
+                    favorite_entry._direct_favorite = true
+                    favorite_entry.collection_ids =
+                        favorite_entry.collection_ids or {}
+                end
+                local encoded_memberships = tostring(
+                    row.favorite_collection_keys or "")
+                if encoded_memberships:sub(1, 1) == "M" then
+                    encoded_memberships = encoded_memberships:sub(2)
+                else
+                    encoded_memberships = ""
+                end
+                for encoded_key in encoded_memberships:gmatch("[^,]+") do
+                    local collection_key = DecodeSQLHex(encoded_key)
+                    if collection_key ~= "" then
+                        favorite_entry.collection_ids[collection_key] = true
+                    end
+                end
+                state.favorite_membership_cache[favorite_key] = true
             end
             if node.is_folder then
                 target.children[#target.children + 1] = node
@@ -5970,6 +6044,7 @@ function RequestCanonicalBrowserPage(
         and MEDIA_TAG_CATALOG_LIMIT or (paging.page_size or 100)
     local cacheable = mode ~= "browser_random" and mode ~= "tag_catalog"
         and mode ~= "resolve_favorite_folder"
+        and mode ~= "favorite_scope_count"
 
     -- Custom tags are reflected in Lua immediately but persisted to SQLite
     -- through the user-data queue. Filter/search/random requests must wait for
@@ -8305,6 +8380,31 @@ function ProcessMediaDatabase()
                     offset = math.max(0,
                         math.floor(tonumber(request.offset) or 0)),
                 }
+                if request.mode == "favorite_scope_count" then
+                    paging.browser_request = nil
+                    paging.active = false
+                    local root_scope_still_active = not request.stale
+                        and state.favorites_mode
+                        and browser.current_folder_id == nil
+                        and browser.collection_scope_key == nil
+                        and browser.smart_mode == nil
+                        and browser.deferred_request == nil
+                    if root_scope_still_active then
+                        RequestCanonicalBrowserPage(
+                            "browser_random", nil, 0, false, false)
+                    else
+                        browser.loading = false
+                        local deferred = browser.deferred_request
+                        if deferred and not state.database.write_active then
+                            browser.deferred_request = nil
+                            RequestCanonicalBrowserPage(
+                                deferred.mode, deferred.folder_id,
+                                deferred.offset, deferred.append, false,
+                                deferred.accordion_target)
+                        end
+                    end
+                    return
+                end
                 if request.cacheable ~= false then
                     PutCanonicalBrowserCache(
                         request.cache_key or CanonicalBrowserCacheKey(
@@ -8711,7 +8811,7 @@ end
 -- numeric indices, so defer the one unavoidable rebuild until a lookup or
 -- view refresh actually needs it. This keeps repeated heart clicks from
 -- becoming O(total favorites) work on every add.
-local function EnsureFavoriteIndex()
+EnsureFavoriteIndex = function()
     if not state.favorite_index_dirty then return end
     local rebuilt = {}
     for index, entry in ipairs(state.favorites or {}) do
@@ -8903,10 +9003,12 @@ function LoadCanonicalFavoritesFromDatabase()
         .. "char(9)||MAX(CASE WHEN collection_items.collection_id=-1 THEN 1 "
         .. "ELSE 0 END)||char(9)||MAX(collection_items.added_at)||char(9)||COALESCE("
         .. "group_concat(CASE WHEN collection_items.collection_id=-1 THEN NULL ELSE "
-        .. "hex(collection_external_keys.external_key) END,','),'') FROM collection_items "
+        .. "hex(collection_external_keys.external_key) END,','),'')||char(9)||COALESCE("
+        .. "MAX(folder_subtree_stats.file_count),0) FROM collection_items "
         .. "JOIN folders ON folders.id=collection_items.folder_id JOIN roots ON roots.id="
         .. "folders.root_id LEFT JOIN collection_external_keys ON collection_external_keys.collection_id="
-        .. "collection_items.collection_id WHERE folders.missing=0 AND roots.enabled=1 "
+        .. "collection_items.collection_id LEFT JOIN folder_subtree_stats ON "
+        .. "folder_subtree_stats.folder_id=folders.id WHERE folders.missing=0 AND roots.enabled=1 "
         .. "GROUP BY folders.id ORDER BY collection_items.added_at,folders.id;"
     local folder_rows, folder_error =
         QueryDatabaseScalarAtPath(database_path, folder_sql)
@@ -8915,16 +9017,21 @@ function LoadCanonicalFavoritesFromDatabase()
         return false
     end
     for line in tostring(folder_rows or ""):gmatch("[^\r\n]+") do
-        local folder_id, path_hex, direct, added, memberships =
+        local folder_id, path_hex, direct, added, memberships, subtree_count =
             (line .. "\t"):match(
-                "^(%d+)\t([^\t]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t?$")
+                "^(%d+)\t([^\t]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t?$")
         if folder_id and path_hex then
+            local canonical_folder_id = tonumber(folder_id)
             local entry = {
                 kind = "folder", path = DecodeSQLHex(path_hex),
                 added = tonumber(added) or 0, collection_ids = {},
-                _canonical_folder_id = tonumber(folder_id),
+                _canonical_folder_id = canonical_folder_id,
                 _direct_favorite = direct == "1",
             }
+            if canonical_folder_id then
+                state.canonical_browser.folder_scope_counts[
+                    canonical_folder_id] = tonumber(subtree_count) or 0
+            end
             for value in (memberships or ""):gmatch("[^,]+") do
                 local id = DecodeSQLHex(value)
                 if id ~= "" and collections_by_id[id] then
@@ -8946,6 +9053,31 @@ function CancelCanonicalFavoriteMutations(paths)
         if key ~= "" then
             versions[key] = (versions[key] or 0) + 1
             pending[key] = nil
+        end
+    end
+end
+
+function CancelCanonicalFavoriteCollectionMutations(collection_id)
+    local collection_key = collection_id and tostring(collection_id) or nil
+    if not collection_key then return end
+    local pending = state.favorite_mutation_pending or {}
+    local versions = state.favorite_mutation_versions or {}
+    state.favorite_mutation_versions = versions
+    for key, mutation in pairs(pending) do
+        if tostring(mutation.collection_id or "") == collection_key then
+            local path_key = NormalizeFavoritePath(mutation.path)
+            if path_key ~= "" then
+                versions[path_key] = (versions[path_key] or 0) + 1
+            end
+            pending[key] = nil
+        end
+    end
+    for _, mutation in ipairs(state.favorite_mutation_inflight or {}) do
+        if tostring(mutation.collection_id or "") == collection_key then
+            local path_key = NormalizeFavoritePath(mutation.path)
+            if path_key ~= "" then
+                versions[path_key] = (versions[path_key] or 0) + 1
+            end
         end
     end
 end
@@ -9299,6 +9431,11 @@ function FavoriteEntryHasCollection(entry, collection_id)
         and entry.collection_ids[tostring(collection_id)] == true
 end
 
+function FavoriteEntryHasAnyMembership(entry)
+    return entry ~= nil and (entry._direct_favorite == true
+        or next(entry.collection_ids or {}) ~= nil)
+end
+
 function FavoritePathHasMembership(path, collection_id)
     local normalized = NormalizeFavoritePath(path)
     local index = FindCachedFavoriteIndex(path)
@@ -9308,8 +9445,7 @@ function FavoritePathHasMembership(path, collection_id)
     end
     local pending = state.favorite_pending_overrides[normalized]
     if pending ~= nil then return pending == true end
-    if entry and (entry._direct_favorite == true
-        or next(entry.collection_ids or {}) ~= nil) then
+    if FavoriteEntryHasAnyMembership(entry) then
         return true
     end
     return state.favorite_membership_cache[normalized] == true
@@ -9322,7 +9458,9 @@ local function RemoveFavoriteEntryIfUnowned(path)
         if NormalizeFavoritePath(entry.path) == key
             and entry._direct_favorite ~= true
             and next(entry.collection_ids or {}) == nil then
-            state.favorite_pending_overrides[key] = nil
+            -- Keep an explicit false until visible canonical rows have observed
+            -- the mutation; clearing this lets an old row decoration win.
+            state.favorite_pending_overrides[key] = false
             table.remove(state.favorites, index)
             state.favorite_index_dirty = true
             return true
@@ -9336,9 +9474,8 @@ local function SyncFavoritePendingOverride(path)
     EnsureFavoriteIndex()
     local index = state.favorite_index[key]
     local entry = index and state.favorites[index] or nil
-    state.favorite_pending_overrides[key] = entry
-        and (entry._direct_favorite == true
-            or next(entry.collection_ids or {}) ~= nil) or false
+    state.favorite_pending_overrides[key] =
+        FavoriteEntryHasAnyMembership(entry)
 end
 
 function AddFavoriteCollectionMembership(path, collection_id, kind)
@@ -9480,6 +9617,9 @@ end
 function MoveFavoritePathsToCollection(
     paths, source_collection_id, target_collection_id, kind)
     if not target_collection_id then return false end
+    -- A move is authoritative for the whole item. Invalidate an older lazy
+    -- membership lookup before its completion can restore the source state.
+    CancelCanonicalFavoriteMutations(paths)
     local source_is_root = source_collection_id == RB_FAVORITES_ROOT_MEMBERSHIP
     local source_key = not source_is_root and source_collection_id
         and tostring(source_collection_id) or nil
@@ -9506,8 +9646,6 @@ function MoveFavoritePathsToCollection(
             entry.collection_ids = entry.collection_ids or {}
             if source_is_root and entry._direct_favorite == true then
                 entry._direct_favorite = false
-                state.favorite_pending_overrides[
-                    NormalizeFavoritePath(entry.path)] = false
                 changed = true
                 entry_changed = true
             end
@@ -9523,7 +9661,12 @@ function MoveFavoritePathsToCollection(
                 entry_changed = true
             end
             if entry_changed then
-                touched[NormalizeFavoritePath(entry.path)] = {
+                local entry_key = NormalizeFavoritePath(entry.path)
+                -- Moving out of the loose Favorites root does not unfavorite
+                -- the item: the target collection now owns its membership.
+                -- Keep Library hearts filled while the database write commits.
+                state.favorite_pending_overrides[entry_key] = true
+                touched[entry_key] = {
                     path = entry.path, kind = entry.kind or kind or "file"}
             end
         end
@@ -9551,6 +9694,8 @@ function MoveFavoritePathsToCollection(
 end
 
 function MoveFavoritePathsToRoot(paths, source_collection_id, kind)
+    -- Keep a delayed membership lookup from replaying the pre-move snapshot.
+    CancelCanonicalFavoriteMutations(paths)
     local source_key = source_collection_id
         and tostring(source_collection_id) or nil
     local changed = false
@@ -9855,9 +10000,9 @@ function BuildFavoriteTree(collections_only, defer_folder_lookup)
         end
     end
     if collections_only then
-        -- All Favorites remains the aggregate smart result page. Loose root
-        -- favorites are kept in a hidden container so the renderer can show
-        -- them directly after all custom and favorited media folders.
+        -- Loose root favorites are kept in a hidden container so the renderer
+        -- can show them directly after custom and favorited media folders in
+        -- the current Favorites Library hierarchy.
         local favorite_files = {
             name = "Root Favorites", name_lower = "root favorites",
             path = "__favorite_files__", is_folder = true,
@@ -9963,9 +10108,13 @@ function BuildFavoriteTree(collections_only, defer_folder_lookup)
                     local target = target_info.node
                     if (entry.kind or "file") == "folder" then
                         local loaded = loaded_folders_by_path[entry_path_key]
-                        local folder_id = favorite_folder_ids[entry_path_key]
+                        -- The persisted folder ID identifies the exact instance
+                        -- selected under overlapping roots. A path lookup can
+                        -- resolve the same text to the configured top-level root
+                        -- and must never replace that saved instance.
+                        local folder_id = entry._canonical_folder_id
+                            or favorite_folder_ids[entry_path_key]
                             or (loaded and loaded._canonical_folder_id)
-                            or entry._canonical_folder_id
                         local node = {
                             name = entry_name,
                             name_lower = entry_name_lower,
@@ -9976,6 +10125,11 @@ function BuildFavoriteTree(collections_only, defer_folder_lookup)
                             depth = target and ((target.depth or 0) + 1) or 0,
                             parent = target,
                             collection_id = target_info.id,
+                            -- A folder shown in Favorites is a favoriteable media
+                            -- folder even when its path is also configured as a
+                            -- Library root. Only Library rows can be root rows.
+                            _canonical_is_library_root = false,
+                            _favorite_root_membership = target_info.id == nil,
                             _canonical_folder_id = folder_id,
                             _canonical_loaded = folder_id == nil
                                 and not state.database_startup_test.enabled,
@@ -10191,8 +10345,7 @@ function RefreshFavoriteMembershipRows(paths, collection_ids, fallback_kind)
         local index = state.favorite_index[key]
         local entry = index and state.favorites[index] or nil
         state.favorite_membership_cache[key] =
-            entry and (entry._direct_favorite == true
-                or next(entry.collection_ids or {}) ~= nil) or false
+            FavoriteEntryHasAnyMembership(entry)
     end
 
     local affected_paths = {}
@@ -10383,6 +10536,29 @@ function IsRootLibraryFolder(path)
     for _, node in ipairs(state.folder_tree or {}) do
         if node._canonical_is_library_root
             and NormalizeFavoritePath(node.path) == key then
+            return true
+        end
+    end
+    return false
+end
+
+function IsRootLibraryFolderNode(node)
+    if not node or not node.is_folder then return false end
+    -- Canonical rows carry their instance identity. This matters for
+    -- overlapping roots: the same physical path can be a protected top-level
+    -- root in one place and a normal, favoriteable child folder in another.
+    if node._canonical_is_library_root ~= nil then
+        return node._canonical_is_library_root == true
+    end
+    return node.parent == nil and IsRootLibraryFolder(node.path)
+end
+
+function IsCanonicalLibraryRootFolderId(folder_id)
+    folder_id = tonumber(folder_id)
+    if not folder_id then return false end
+    for _, node in ipairs(state.folder_tree or {}) do
+        if node._canonical_is_library_root == true
+            and tonumber(node._canonical_folder_id) == folder_id then
             return true
         end
     end
@@ -10990,16 +11166,12 @@ end
 function QueueCanonicalFavoriteCollectionDelete(external_key, parent_id)
     local old_id = "(SELECT collection_id FROM collection_external_keys WHERE external_key="
         .. SQLQuote(tostring(external_key)) .. ")"
-    local sql = ""
-    if parent_id then
-        local target = "(SELECT collection_id FROM collection_external_keys WHERE external_key="
-            .. SQLQuote(tostring(parent_id)) .. ")"
-        sql = sql .. "INSERT OR IGNORE INTO collection_items"
-            .. "(collection_id,file_id,root_id,folder_id,added_at) SELECT "
-            .. target .. ",file_id,root_id,folder_id,added_at FROM collection_items WHERE "
-            .. "collection_id=" .. old_id .. ";\n"
-    end
-    sql = sql .. "DELETE FROM collection_items WHERE collection_id=" .. old_id .. ";\n"
+    -- Deleting an organizational folder removes that folder's membership.
+    -- Child organizational folders move up one level, but loose items are not
+    -- silently promoted into the parent (which previously made delete behave
+    -- differently for top-level and nested folders).
+    local sql = "DELETE FROM collection_items WHERE collection_id="
+        .. old_id .. ";\n"
         .. "UPDATE collections SET parent_id="
         .. (parent_id and "(SELECT collection_id FROM collection_external_keys WHERE external_key="
             .. SQLQuote(tostring(parent_id)) .. ")" or "NULL")
@@ -11226,7 +11398,11 @@ function AddFavorite(path, kind, collection_id, defer_finalize, defer_queue,
     canonical_folder_id)
     if not path or path == "" then return false end
     if tostring(path):match("^__fav_collection__") then return false end
-    if kind == "folder" and IsRootLibraryFolder(path) then return false end
+    if kind == "folder" and IsRootLibraryFolder(path)
+        and (not canonical_folder_id
+            or IsCanonicalLibraryRootFolderId(canonical_folder_id)) then
+        return false
+    end
     local existing = FindCachedFavoriteIndex(path)
     if existing then
         if collection_id then
@@ -11335,14 +11511,24 @@ function DeleteFavoriteCollection(collection_id)
     end
     if not found then return false end
 
+    -- A lookup that was queued while the folder still existed must not publish
+    -- that deleted collection back into the in-memory membership cache.
+    CancelCanonicalFavoriteCollectionMutations(collection_id)
+
+    local affected_paths = {}
+    local affected_seen = {}
     for _, entry in ipairs(state.favorites or {}) do
         local memberships = entry.collection_ids or {}
         if memberships[collection_id] then
             memberships[collection_id] = nil
-            if parent_id then memberships[parent_id] = true end
-            if entry._direct_favorite ~= true and not parent_id then
-                state.favorite_pending_overrides[
-                    NormalizeFavoritePath(entry.path)] = nil
+            local path_key = NormalizeFavoritePath(entry.path)
+            if path_key ~= "" and not affected_seen[path_key] then
+                affected_seen[path_key] = true
+                affected_paths[#affected_paths + 1] = entry.path
+            end
+            if path_key ~= "" then
+                state.favorite_pending_overrides[path_key] =
+                    FavoriteEntryHasAnyMembership(entry)
             end
         end
     end
@@ -11351,7 +11537,7 @@ function DeleteFavoriteCollection(collection_id)
         if entry._direct_favorite ~= true
             and next(entry.collection_ids or {}) == nil then
             state.favorite_pending_overrides[
-                NormalizeFavoritePath(entry.path)] = nil
+                NormalizeFavoritePath(entry.path)] = false
             table.remove(state.favorites, index)
             state.favorite_index_dirty = true
         end
@@ -11369,6 +11555,10 @@ function DeleteFavoriteCollection(collection_id)
     state.favorite_open_folders["collection:" .. collection_id] = nil
     QueueCanonicalFavoriteCollectionDelete(collection_id, parent_id)
     RefreshFavoritesView()
+    if #affected_paths > 0 then
+        RefreshFavoriteMembershipRows(
+            affected_paths, {[collection_id] = true}, "file")
+    end
     InvalidateCanonicalFavoriteViews()
     return true
 end
@@ -11814,6 +12004,13 @@ function GetFavoriteContextCollectionId(node)
     return nil
 end
 
+function IsFavoriteRootMembershipNode(node)
+    return state.favorites_mode and node ~= nil
+        and (node._favorite_root_membership == true
+            or (node.parent ~= nil
+                and node.parent.path == "__favorite_files__"))
+end
+
 function GetFavoriteDragSource(node)
     if not state.favorites_mode or not node then
         return "library", nil
@@ -11887,12 +12084,26 @@ local function GetFavoriteRowMembership(node)
     else
         local index = state.favorite_index[normalized]
         local entry = index and state.favorites[index] or nil
-        favorite = entry and entry._direct_favorite == true or false
-        if not favorite and node._canonical_favorite ~= nil then
-            favorite = node._canonical_favorite == true
-        end
-        if not favorite and state.favorite_membership_cache[normalized] ~= nil then
+        if entry then
+            favorite = FavoriteEntryHasAnyMembership(entry)
+        elseif state.favorite_membership_cache[normalized] ~= nil then
             favorite = state.favorite_membership_cache[normalized] == true
+        elseif state.favorites_mode and node._canonical_favorite ~= nil then
+            -- A row returned by an active Favorites query is authoritative for
+            -- that view only. Never reuse it as global Library heart state.
+            favorite = node._canonical_favorite == true
+        else
+            favorite = false
+            if state.database.canonical and normalized ~= ""
+                and not state.favorite_membership_pending_paths[normalized]
+                and not state.favorite_membership_inflight_paths[normalized] then
+                -- Mutations can invalidate decoration caches without reloading
+                -- the Library page. Rehydrate visible unknown rows on demand.
+                state.favorite_membership_pending_paths[normalized] = true
+                state.favorite_membership_next_at = math.max(
+                    state.favorite_membership_next_at or 0,
+                    r.time_precise() + 0.10)
+            end
         end
     end
     local inherited = not favorite
@@ -11939,12 +12150,7 @@ function ShouldDrawFavoriteRowHeart(node)
         return false
     end
     if not node.is_folder then return true end
-    if node._canonical_is_library_root then return false end
-    if node._favorite_root_check_path ~= node.path then
-        node._favorite_root_check_path = node.path
-        node._favorite_is_library_root = IsRootLibraryFolder(node.path)
-    end
-    return not node._favorite_is_library_root
+    return not IsRootLibraryFolderNode(node)
 end
 
 function GetFavoriteNodeInstanceKey(node)
@@ -12001,6 +12207,7 @@ function DrawFavoriteRowHeart(node, prepared_hot, row_key)
     )
     local favorite, inherited = GetFavoriteRowMembership(node)
     local collection_id = GetFavoriteContextCollectionId(node)
+    local root_membership = IsFavoriteRootMembershipNode(node)
     if collection_id then
         -- Never perform an on-demand SQLite lookup from the draw loop. Paged
         -- collection rows are already membership-qualified; hydrate the one
@@ -12041,7 +12248,18 @@ function DrawFavoriteRowHeart(node, prepared_hot, row_key)
     imgui.DrawList_AddText(
         imgui.GetWindowDrawList(ctx), heart_x, heart_y, color, glyph)
     local mouse_clicked = imgui.IsMouseClicked(ctx, 0)
-    if hit and mouse_clicked then
+    local popup_open = false
+    if imgui.IsPopupOpen and imgui.PopupFlags_AnyPopup then
+        local popup_ok, any_popup = pcall(
+            imgui.IsPopupOpen, ctx, "", imgui.PopupFlags_AnyPopup)
+        popup_open = popup_ok and any_popup == true
+    end
+    if hit and mouse_clicked and not popup_open
+        and not state.context_menu_active then
+        -- Popup menu clicks are global mouse clicks too. If a context menu is
+        -- positioned over the heart gutter, allowing the underlying row to
+        -- observe that click queues a direct/root favorite in the same frame
+        -- as the chosen custom-folder action.
         -- The heart is draw-list geometry over an active TreeNode. Remember
         -- the press across frames so a small click movement cannot fall
         -- through into the row/folder drag handlers and stop playback.
@@ -12054,6 +12272,12 @@ function DrawFavoriteRowHeart(node, prepared_hot, row_key)
                 action_paths, collection_id, false,
                 action_kind, node._canonical_folder_id)
                     and #action_paths or 0
+        elseif favorite and root_membership then
+            -- The loose-root row represents only direct ownership. Removing it
+            -- must preserve copies that still belong to custom folders.
+            changed = SetFavoritePaths(
+                action_paths, false, action_kind, nil,
+                node._canonical_folder_id)
         elseif favorite then
             changed = RemoveAllFavoriteMemberships(
                 action_paths, action_kind)
@@ -17915,6 +18139,20 @@ function GetSelectedFilePaths(fallback_path)
     return paths
 end
 
+function ClearMediaFileSelection()
+    state.cursor_path = nil
+    state.cursor_type = nil
+    state.cursor_favorite_instance_key = nil
+    state.selected_path = nil
+    state.multi_selected = {}
+    state.selected_file_row_keys = {}
+    state.selection_anchor = nil
+    state.selection_anchor_row_key = nil
+    state.pending_single_node = nil
+    state.pending_single_row_key = nil
+    state.pending_ctrl_file = nil
+end
+
 function ClearMediaBrowserSelection()
     local canonical_favorite_scope_changed = false
     if state.favorites_mode and state.database_startup_test.enabled then
@@ -17927,17 +18165,7 @@ function ClearMediaBrowserSelection()
         ClearCanonicalFavoriteFolderFacetScope(true)
     end
     state.selected_folder_scope = nil
-    state.cursor_path = nil
-    state.cursor_type = nil
-    state.cursor_favorite_instance_key = nil
-    state.selected_path = nil
-    state.multi_selected = {}
-    state.selected_file_row_keys = {}
-    state.selection_anchor = nil
-    state.selection_anchor_row_key = nil
-    state.pending_single_node = nil
-    state.pending_single_row_key = nil
-    state.pending_ctrl_file = nil
+    ClearMediaFileSelection()
     if state.search_text ~= "" or MediaFiltersActive() then
         state.force_search_update = true
         state.needs_visible_update = true
@@ -18160,7 +18388,8 @@ function SetCursorToFileNode(node, ensure_visible, row_key)
         -- scoped to the selected physical Favorites folder. Preserve that
         -- authoritative browser scope instead of returning to Favorites home
         -- when a filtered file is clicked.
-        if not physical_parent and not browser.current_folder_id then
+        if not physical_parent and not browser.current_folder_id
+            and not CanonicalResultViewActive() then
             ClearCanonicalFavoriteFolderFacetScope(true)
             browser.current_folder_id = nil
             browser.current_path = nil
@@ -18842,9 +19071,9 @@ function DrawSettingsPopup()
             260, settings_available_height - 58)
         if imgui.BeginTabBar(ctx, "##settings_tabs") then
             if imgui.BeginTabItem(ctx, "Playback") then
-                imgui.BeginChild(
+                if imgui.BeginChild(
                     ctx, "##settings_playback", 0,
-                    settings_body_height, 0, FLG_NO_NAV_INPUTS)
+                    settings_body_height, 0, FLG_NO_NAV_INPUTS) then
         imgui.Text(ctx, "Playback")
         imgui.Separator(ctx)
         DrawOneShotModeSettings()
@@ -18930,13 +19159,14 @@ function DrawSettingsPopup()
             imgui.EndPopup(ctx)
         end
                 imgui.EndChild(ctx)
+                end
                 imgui.EndTabItem(ctx)
             end
 
             if imgui.BeginTabItem(ctx, "Database") then
-                imgui.BeginChild(
+                if imgui.BeginChild(
                     ctx, "##settings_library", 0,
-                    settings_body_height, 0, FLG_NO_NAV_INPUTS)
+                    settings_body_height, 0, FLG_NO_NAV_INPUTS) then
         imgui.Spacing(ctx)
         imgui.Text(ctx, "Library database")
         imgui.Separator(ctx)
@@ -19222,13 +19452,14 @@ function DrawSettingsPopup()
             imgui.EndPopup(ctx)
         end
                 imgui.EndChild(ctx)
+                end
                 imgui.EndTabItem(ctx)
             end
 
             if imgui.BeginTabItem(ctx, "Appearance") then
-                imgui.BeginChild(
+                if imgui.BeginChild(
                     ctx, "##settings_appearance", 0,
-                    settings_body_height, 0, FLG_NO_NAV_INPUTS)
+                    settings_body_height, 0, FLG_NO_NAV_INPUTS) then
         imgui.Spacing(ctx)
         imgui.Text(ctx, "Media Tags")
         imgui.Separator(ctx)
@@ -19408,6 +19639,7 @@ function DrawSettingsPopup()
             SaveSettings()
         end
                 imgui.EndChild(ctx)
+                end
                 imgui.EndTabItem(ctx)
             end
 
@@ -21278,6 +21510,8 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
         end
         local favorite_collection_id =
             GetFavoriteContextCollectionId(file_node)
+        local favorite_root_membership =
+            IsFavoriteRootMembershipNode(file_node)
         local selected_favorites = true
         local favorite_membership_known = true
         for _, path in ipairs(selected_paths) do
@@ -21288,14 +21522,18 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
             if favorite_collection_id then
                 membership = entry and FavoriteEntryHasCollection(
                     entry, favorite_collection_id) or nil
+            elseif favorite_root_membership then
+                -- A row rendered in the loose-root section is authoritative
+                -- for direct/root membership, regardless of copies elsewhere.
+                membership = true
             else
                 local pending = state.favorite_pending_overrides[key]
                 if pending ~= nil then
                     membership = pending == true
+                elseif entry then
+                    membership = FavoriteEntryHasAnyMembership(entry)
                 elseif state.favorite_membership_cache[key] ~= nil then
                     membership = state.favorite_membership_cache[key] == true
-                elseif entry then
-                    membership = entry._direct_favorite == true
                 end
             end
             if membership == nil then
@@ -21323,6 +21561,10 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
                     and (#selected_paths > 1
                         and "Remove Selected from this Favorites folder"
                         or "Remove from this Favorites folder")
+                    or favorite_root_membership
+                    and (#selected_paths > 1
+                        and "Remove Selected from Favorites root"
+                        or "Remove from Favorites root")
                     or (#selected_paths > 1
                         and "Remove Selected from Favorites"
                         or "Remove from Favorites"))
@@ -21332,6 +21574,8 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
             if selected_favorites and favorite_collection_id then
                 SetFavoriteCollectionMemberships(
                     selected_paths, favorite_collection_id, false, "file")
+            elseif selected_favorites and favorite_root_membership then
+                SetFavoritePaths(selected_paths, false, "file")
             elseif selected_favorites then
                 RemoveAllFavoriteMemberships(selected_paths, "file")
             elseif favorite_collection_id then
@@ -21344,7 +21588,8 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
         if not favorite_membership_known and imgui.EndDisabled then
             imgui.EndDisabled(ctx)
         end
-        if selected_favorites and favorite_collection_id
+        if selected_favorites
+            and (favorite_collection_id or favorite_root_membership)
             and imgui.MenuItem(ctx, #selected_paths > 1
                 and "Remove Selected from Favorites completely"
                 or "Remove from Favorites completely") then
@@ -21352,8 +21597,8 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
         end
         if #state.favorite_collections > 0 then
             if imgui.BeginMenu(ctx, #selected_paths > 1
-                and "Add Selected to Favorites Folder"
-                or "Add to Favorites Folder") then
+                and "Add/Remove Selected from Favorites Folder"
+                or "Add/Remove from Favorites Folder") then
                 DrawFavoriteCollectionMenuTree(
                     GetFavoriteCollectionMenuTree(),
                     selected_paths, "file")
@@ -21724,9 +21969,15 @@ local function TriggerUnifiedBrowserRandom()
         state.pending_single_node = nil
         state.pending_single_row_key = nil
         state.pending_ctrl_file = nil
+        local root_favorites_scope = state.favorites_mode
+            and browser.current_folder_id == nil
+            and browser.collection_scope_key == nil
+            and browser.smart_mode == nil
+        local request_mode = root_favorites_scope
+            and GetCanonicalFavoriteScopeCount(nil) == nil
+            and "favorite_scope_count" or "browser_random"
         RequestCanonicalBrowserPage(
-            "browser_random", browser.current_folder_id,
-            0, false, false)
+            request_mode, browser.current_folder_id, 0, false, false)
         return true
     end
 
@@ -22289,7 +22540,6 @@ function DrawCanonicalMainBrowser(avail_h)
         ctx, "browser_pane", 0, avail_h,
         FLG_CHILD_BORDER,
         FLG_NO_NAV_INPUTS | FLG_NO_SCROLLBAR | FLG_NO_SCROLL_MOUSE) then
-        imgui.EndChild(ctx)
         state.hovered_path = nil
         state.hovered_row_key = nil
         return
@@ -22334,8 +22584,14 @@ function DrawCanonicalMainBrowser(avail_h)
     end
     imgui.Separator(ctx)
 
-    imgui.BeginChild(
-        ctx, "##canonical_main_scroll_rows", 0, 0, 0, FLG_NO_NAV_INPUTS)
+    if not imgui.BeginChild(
+        ctx, "##canonical_main_scroll_rows", 0, 0, 0,
+        FLG_NO_NAV_INPUTS) then
+        imgui.EndChild(ctx)
+        state.hovered_path = nil
+        state.hovered_row_key = nil
+        return
+    end
 
     if (browser.window_start_offset or 0) > 0 then
         local previous_offset = math.max(0,
@@ -22461,6 +22717,7 @@ function DrawCanonicalMainBrowser(avail_h)
                     path = row.path,
                     name = row.name,
                     is_folder = true,
+                    _canonical_is_library_root = row.kind == "R",
                     _canonical_folder_id = row.folder_id,
                 }
                 row._main_node = node
@@ -22720,7 +22977,10 @@ function DrawCanonicalMainBrowser(avail_h)
     if not state.block_browser_input and imgui.IsWindowHovered(ctx)
         and imgui.IsMouseClicked(ctx, 0)
         and not imgui.IsAnyItemHovered(ctx) then
-        ClearMediaBrowserSelection()
+        -- Blank space in a flat search/filter result clears only the selected
+        -- file. The query, key/type/tag filters and Favorites scope remain
+        -- active until the user explicitly changes or clears them.
+        ClearMediaFileSelection()
     end
     if not state.search_active then HandleBrowserKeys() end
     if suppress_hover_style then imgui.PopStyleColor(ctx) end
@@ -22777,7 +23037,6 @@ function DrawAccordionBrowser(avail_h)
         ctx, "browser_pane", 0, avail_h,
         FLG_CHILD_BORDER,
         FLG_NO_NAV_INPUTS | FLG_NO_SCROLLBAR | FLG_NO_SCROLL_MOUSE) then
-        imgui.EndChild(ctx)
         state.hovered_path = nil
         state.hovered_row_key = nil
         return
@@ -22797,7 +23056,6 @@ function DrawAccordionBrowser(avail_h)
     if not imgui.BeginChild(
         ctx, "accordion_browser_scroll", 0, 0,
         0, FLG_NO_NAV_INPUTS) then
-        imgui.EndChild(ctx)
         imgui.EndChild(ctx)
         return
     end
@@ -23352,7 +23610,7 @@ function DrawAccordionBrowser(avail_h)
                     imgui.Separator(ctx)
                     if node.is_folder and not node.is_collection
                         and node.path ~= "__favorite_files__" then
-                        local scope_type = IsRootLibraryFolder(node.path)
+                        local scope_type = IsRootLibraryFolderNode(node)
                             and "root" or "folder"
                         if imgui.BeginMenu(ctx, "Category") then
                             imgui.TextDisabled(ctx,
@@ -23413,7 +23671,7 @@ function DrawAccordionBrowser(avail_h)
                         has_context_membership = FavoritePathHasMembership(
                             node.path, folder_collection_id)
                     end
-                    if not IsRootLibraryFolder(node.path)
+                    if not IsRootLibraryFolderNode(node)
                         and not has_context_membership
                         and imgui.MenuItem(ctx, "Add to Favorites") then
                         SetFavoritePaths(
@@ -23441,12 +23699,12 @@ function DrawAccordionBrowser(avail_h)
                         RemoveFavoriteCompletely(
                             node.path, node.is_folder and "folder" or "file")
                     end
-                    if not IsRootLibraryFolder(node.path)
+                    if not IsRootLibraryFolderNode(node)
                         and #state.favorite_collections > 0
                         and imgui.BeginMenu(ctx,
                             state.multi_selected[node.path]
-                                and "Add Selected to Favorites Folder"
-                                or "Add to Favorites Folder") then
+                                and "Add/Remove Selected from Favorites Folder"
+                                or "Add/Remove from Favorites Folder") then
                         local target_paths = state.multi_selected[node.path]
                             and GetSelectedFilePaths(node.path) or {node.path}
                         DrawFavoriteCollectionMenuTree(
@@ -23460,7 +23718,7 @@ function DrawAccordionBrowser(avail_h)
                             PromptAddFavoriteFolder(nil)
                         end
                         imgui.EndMenu(ctx)
-                    elseif not IsRootLibraryFolder(node.path)
+                    elseif not IsRootLibraryFolderNode(node)
                         and #state.favorite_collections == 0
                         and imgui.MenuItem(
                             ctx, "Create Favorites Folder...") then
@@ -23468,7 +23726,7 @@ function DrawAccordionBrowser(avail_h)
                     end
                 end
                 if not node.is_collection and not state.favorites_mode
-                    and IsRootLibraryFolder(node.path) then
+                    and IsRootLibraryFolderNode(node) then
                     imgui.Separator(ctx)
                     local refresh_disabled = RootLibraryActionsBlocked()
                     local refresh_disabled_scope = false
@@ -27043,8 +27301,8 @@ function DrawFXBrowser()
             else
                 DrawFXFolderView()
             end
+            imgui.EndChild(ctx)
         end
-        imgui.EndChild(ctx)
 
         local can_add = next(fx.selected_idents or {}) ~= nil
         if not can_add then imgui.BeginDisabled(ctx) end
@@ -27064,8 +27322,8 @@ function DrawFXBrowser()
         if not can_add then imgui.EndDisabled(ctx) end
         imgui.SameLine(ctx)
         imgui.TextDisabled(ctx, fx.status)
+        imgui.EndChild(ctx)
     end
-    imgui.EndChild(ctx)
     imgui.PopStyleColor(ctx, 2)
     DrawFXFolderDialog()
 end
@@ -29169,14 +29427,14 @@ function DrawActionsBrowser()
                 DrawActionsLibraryRoots()
             end
             if actions.suppress_mouse_hover then imgui.PopStyleColor(ctx) end
+            imgui.EndChild(ctx)
         end
-        imgui.EndChild(ctx)
         local selected_count = actions.selected_count or 0
         imgui.TextDisabled(ctx, selected_count > 0
             and string.format("%d selected  |  %s", selected_count, actions.status)
             or actions.status)
+        imgui.EndChild(ctx)
     end
-    imgui.EndChild(ctx)
     imgui.PopStyleColor(ctx, 2)
     DrawActionsFolderDialog()
 end
@@ -29525,8 +29783,8 @@ function DrawEULAAcceptance()
         else
             imgui.TextWrapped(ctx, eula.error or "The agreement could not be loaded.")
         end
+        imgui.EndChild(ctx)
     end
-    imgui.EndChild(ctx)
     imgui.PopStyleColor(ctx, 2)
     imgui.Spacing(ctx)
 
