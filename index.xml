@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="ReaBrowse" commit="8941ebbfeb653c90ceaeb0a6e3862029d1ed18eb">
+<index version="1" name="ReaBrowse" commit="45c617f6a3207870b3fb04b83b87090f29324311">
   <category name="ReaBrowse">
     <reapack name="ReaBrowse.lua" type="script" desc="ReaBrowse">
       <metadata>
@@ -58,6 +58,22 @@ or creates a new Cartridge when none is active.]]></changelog>
         <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/8941ebbfeb653c90ceaeb0a6e3862029d1ed18eb/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
         <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/8941ebbfeb653c90ceaeb0a6e3862029d1ed18eb/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
         <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/8941ebbfeb653c90ceaeb0a6e3862029d1ed18eb/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
+      </version>
+      <version name="1.0.0-rc5" author="davvolinni-ui" time="2026-08-24T08:33:49Z">
+        <changelog><![CDATA[Fixed Favorites root/custom-folder ownership across add, remove, copy,
+move, folder deletion, overlapping roots, and Library heart rendering.
+Kept Favorites search and structured-filter results visible when a file
+or the blank result area is selected.
+Improved Random performance and scope handling for Favorites root,
+custom folders, physical folders, Recent, and Most Used.
+Fixed clipped ReaImGui child panels causing duplicate EndChild calls.]]></changelog>
+        <source main="main" platform="win64">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/ReaBrowse.lua</source>
+        <source platform="win64" file="ReaBrowse_Canonical_Schema_v5.sql">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/ReaBrowse_Canonical_Schema_v5.sql</source>
+        <source platform="win64" file="sqlite3.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/sqlite3.exe</source>
+        <source platform="win64" file="EULA.md">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/EULA.md</source>
+        <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
+        <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
+        <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
       </version>
     </reapack>
   </category>
