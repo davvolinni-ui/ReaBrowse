@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="ReaBrowse" commit="45c617f6a3207870b3fb04b83b87090f29324311">
+<index version="1" name="ReaBrowse" commit="75d30cbb98cb900e63bc7e08555bcc187eb5dc67">
   <category name="ReaBrowse">
     <reapack name="ReaBrowse.lua" type="script" desc="ReaBrowse">
       <metadata>
@@ -74,6 +74,19 @@ Fixed clipped ReaImGui child panels causing duplicate EndChild calls.]]></change
         <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
         <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
         <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/45c617f6a3207870b3fb04b83b87090f29324311/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
+      </version>
+      <version name="1.0.0-rc6" author="davvolinni-ui" time="2026-08-31T23:08:03Z">
+        <changelog><![CDATA[Added conservative tempo detection for loop filenames containing one
+standalone 50-200 BPM field, while ignoring technical/version tokens.
+Adding a virtual instrument now assigns all MIDI inputs and channels,
+record-arms the track, and enables input monitoring.]]></changelog>
+        <source main="main" platform="win64">https://github.com/davvolinni-ui/ReaBrowse/raw/75d30cbb98cb900e63bc7e08555bcc187eb5dc67/ReaBrowse/ReaBrowse.lua</source>
+        <source platform="win64" file="ReaBrowse_Canonical_Schema_v5.sql">https://github.com/davvolinni-ui/ReaBrowse/raw/75d30cbb98cb900e63bc7e08555bcc187eb5dc67/ReaBrowse/ReaBrowse_Canonical_Schema_v5.sql</source>
+        <source platform="win64" file="sqlite3.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/75d30cbb98cb900e63bc7e08555bcc187eb5dc67/ReaBrowse/sqlite3.exe</source>
+        <source platform="win64" file="EULA.md">https://github.com/davvolinni-ui/ReaBrowse/raw/75d30cbb98cb900e63bc7e08555bcc187eb5dc67/ReaBrowse/EULA.md</source>
+        <source platform="win64" file="THIRD_PARTY_NOTICES.md">https://github.com/davvolinni-ui/ReaBrowse/raw/75d30cbb98cb900e63bc7e08555bcc187eb5dc67/ReaBrowse/THIRD_PARTY_NOTICES.md</source>
+        <source platform="win64" file="worker/publish/win-x64/ReaBrowseWorker.exe">https://github.com/davvolinni-ui/ReaBrowse/raw/75d30cbb98cb900e63bc7e08555bcc187eb5dc67/ReaBrowse/worker/publish/win-x64/ReaBrowseWorker.exe</source>
+        <source platform="win64" type="extension" file="reaper_reabrowse_native_drag.dll">https://github.com/davvolinni-ui/ReaBrowse/raw/75d30cbb98cb900e63bc7e08555bcc187eb5dc67/ReaBrowse/reaper_reabrowse_native_drag.dll</source>
       </version>
     </reapack>
   </category>
