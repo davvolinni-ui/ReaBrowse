@@ -1,5 +1,5 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc5
+-- @version 1.0.0-rc6
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
@@ -9,13 +9,10 @@
 --   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
 --   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Fixed Favorites root/custom-folder ownership across add, remove, copy,
---   move, folder deletion, overlapping roots, and Library heart rendering.
---   Kept Favorites search and structured-filter results visible when a file
---   or the blank result area is selected.
---   Improved Random performance and scope handling for Favorites root,
---   custom folders, physical folders, Recent, and Most Used.
---   Fixed clipped ReaImGui child panels causing duplicate EndChild calls.
+--   Added conservative tempo detection for loop filenames containing one
+--   standalone 50-200 BPM field, while ignoring technical/version tokens.
+--   Adding a virtual instrument now assigns all MIDI inputs and channels,
+--   record-arms the track, and enables input monitoring.
 -- @metapackage
 -- @provides
 --   [win64 main] .
@@ -15292,6 +15289,32 @@ function DetectExplicitFilenameBPM(filepath)
         bpm = tonumber(name:match(
             "kshmr[%s_%-]+sok%d+[%s_%-]+(%d%d?%d?)[%s_%-]+"))
     end
+    -- Loop libraries commonly use a bare tempo field, for example
+    -- MUL_125_TOP_LOOP_03. Only infer an unlabeled value when the filename
+    -- itself says loop, exactly one distinct token is in the conservative
+    -- 50-200 BPM range, and smaller ordinal fields therefore cannot qualify.
+    if not bpm then
+        local tokens = " " .. name:gsub("[^%w]+", " ") .. " "
+        local names_loop = tokens:find(" loop ", 1, true)
+            or tokens:find(" loops ", 1, true)
+        if names_loop then
+            local inferred = nil
+            local ambiguous = false
+            for token in tokens:gmatch("%S+") do
+                -- Only standalone numeric fields qualify. Technical/version
+                -- tokens such as 96k, 24bit, v120, and sr48 must remain IDs.
+                local value = tonumber(token)
+                if value and value >= 50 and value <= 200 then
+                    if inferred and inferred ~= value then
+                        ambiguous = true
+                        break
+                    end
+                    inferred = value
+                end
+            end
+            if not ambiguous then bpm = inferred end
+        end
+    end
     return bpm and bpm >= 30 and bpm <= 400 and bpm or nil
 end
 
@@ -25294,6 +25317,15 @@ function ShowAddedTrackFX(track, fx_index, rec_fx, show_chain)
         track, GetTrackFXShowIndex(fx_index, rec_fx), show_chain and 1 or 3)
 end
 
+function ConfigureTrackForInstrumentInput(track)
+    if not track or track == r.GetMasterTrack(0) then return end
+    -- Match REAPER's virtual-instrument insertion defaults: all MIDI inputs,
+    -- all channels, armed, with input monitoring enabled.
+    r.SetMediaTrackInfo_Value(track, "I_RECINPUT", 6112)
+    r.SetMediaTrackInfo_Value(track, "I_RECARM", 1)
+    r.SetMediaTrackInfo_Value(track, "I_RECMON", 1)
+end
+
 function AddFXToTrack(item, track, rec_fx, show_chain, insert_index)
     if not track then
         state.fx_browser.status = "Select a track, then add the plug-in."
@@ -25309,6 +25341,9 @@ function AddFXToTrack(item, track, rec_fx, show_chain, insert_index)
             track, item.name, rec_fx == true, instantiate)
     end
     if fx_index >= 0 then
+        if item.kind == "instrument" and not rec_fx then
+            ConfigureTrackForInstrumentInput(track)
+        end
         ShowAddedTrackFX(track, fx_index, rec_fx, show_chain)
         RecordFXUse(item)
         local display_name = (item.name or item.ident or "")
@@ -25343,6 +25378,7 @@ function AddFXItemsToTrack(items, track, rec_fx, show_chain, insert_index)
 
     r.Undo_BeginBlock()
     local added, last_index = 0, nil
+    local added_instrument = false
     local track_names = {}
     for _, item in ipairs(items) do
         local instantiate = GetFXInstantiatePosition(
@@ -25356,6 +25392,7 @@ function AddFXItemsToTrack(items, track, rec_fx, show_chain, insert_index)
         if fx_index >= 0 then
             added = added + 1
             last_index = fx_index
+            added_instrument = added_instrument or item.kind == "instrument"
             local display_name = (item.name or item.ident or "")
                 :gsub("^[^:]+:%s*", "")
             if display_name ~= "" then
@@ -25363,6 +25400,9 @@ function AddFXItemsToTrack(items, track, rec_fx, show_chain, insert_index)
             end
             RecordFXUse(item, true)
         end
+    end
+    if added_instrument and not rec_fx then
+        ConfigureTrackForInstrumentInput(track)
     end
     if #track_names > 0 then
         SetTrackNameIfBlank(track, table.concat(track_names, " + "))
@@ -25397,6 +25437,7 @@ function CreateTrackWithFXItems(items, rec_fx)
         return false
     end
     local added, last_index = 0, nil
+    local added_instrument = false
     local track_names = {}
     for _, item in ipairs(items) do
         local fx_index = r.TrackFX_AddByName(
@@ -25408,6 +25449,7 @@ function CreateTrackWithFXItems(items, rec_fx)
         if fx_index >= 0 then
             added = added + 1
             last_index = fx_index
+            added_instrument = added_instrument or item.kind == "instrument"
             local display_name = (item.name or item.ident or "")
                 :gsub("^[^:]+:%s*", "")
             if display_name ~= "" then
@@ -25415,6 +25457,9 @@ function CreateTrackWithFXItems(items, rec_fx)
             end
             RecordFXUse(item, true)
         end
+    end
+    if added_instrument and not rec_fx then
+        ConfigureTrackForInstrumentInput(track)
     end
     if #track_names > 0 then
         SetTrackNameIfBlank(track, table.concat(track_names, " + "))
