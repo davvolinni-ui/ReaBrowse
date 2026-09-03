@@ -905,7 +905,7 @@ end
 -- Lightweight scan-time vocabulary. This intentionally recognizes useful
 -- musical concepts instead of turning every filename word into a database tag.
 -- Specific terms precede broad terms so the eight-tag cap keeps useful detail.
-AUTO_TAG_VERSION = 11
+AUTO_TAG_VERSION = 13
 
 -- High-confidence glossary relationships. These are intentionally separate
 -- from lexical aliases: a file can be a hi-hat even when none of its nearby
@@ -962,7 +962,9 @@ local AUTO_TAG_RULES = {
     {"electric guitar", {"electric guitar", "electric gtr"}},
     {"acoustic guitar", {"acoustic guitar", "acoustic gtr"}},
     {"bass guitar", {"bass guitar", "bass gtr"}},
-    {"vocal", {"vocal", "vocals", "vox", "voice", "acapella", "acappella"}},
+    {"vocal", {"vocal", "vocals", "vox", "voice", "acapella", "acappella",
+        "ad lib", "ad libs", "adlib", "adlibs", "sung phrase",
+        "sung phrases", "vocal phrase", "vocal phrases"}},
     {"choir", {"choir", "choral"}},
     {"spoken", {"spoken", "speech", "spoken word"}},
     {"strings", {"string", "strings", "violin", "viola", "cello"}},
@@ -1226,9 +1228,18 @@ local function CollectPriorityLoopTags(
         and detected_key_pc ~= nil
         and not explicit_component_tag
         and not explicit_drum_tag
+    local explicit_vocal_phrase =
+        AutoTagTextMatches(filename, "ad lib")
+        or AutoTagTextMatches(filename, "ad libs")
+        or AutoTagTextMatches(filename, "adlib")
+        or AutoTagTextMatches(filename, "adlibs")
+        or AutoTagTextMatches(filename, "sung phrase")
+        or AutoTagTextMatches(filename, "sung phrases")
+        or AutoTagTextMatches(filename, "vocal phrase")
+        or AutoTagTextMatches(filename, "vocal phrases")
     if (instrumental_context or unlabeled_musical_loop)
         and not component_path and not drum_context
-        and not explicit_component_tag then
+        and not explicit_component_tag and not explicit_vocal_phrase then
         add_tag("melody loops",
             instrumental_context and "folder" or "filename", 0.9)
     end
@@ -2131,7 +2142,7 @@ end
 
 function StartMediaFilterIndexBuild()
     local index = state.media_filter_index
-    if state.database_startup_test.enabled then
+    if state.database.canonical then
         -- Canonical SQLite pages and tag catalogs already provide this data.
         -- Building the complete legacy Lua index after a scan competes with
         -- the first interactive folder query and duplicates every file/tag in
@@ -2200,7 +2211,7 @@ end
 
 function ProcessMediaFilterIndexBuild()
     local index = state.media_filter_index
-    if state.database_startup_test.enabled then
+    if state.database.canonical then
         if index.building or index.ready or #(index.files or {}) > 0 then
             StartMediaFilterIndexBuild()
         end
@@ -2595,9 +2606,12 @@ local LIBRARY_SCAN_SPEEDS = {
     },
     turbo = {
         label = "Dedicated",
-        detail = "24,576 entries / 20 ms per frame; unthrottled worker",
-        budget = 24576, time_slice = 0.020,
-        finalize_budget = 32768, finalize_slice = 0.020,
+        detail = "73,728 entries / 60 ms per frame; unthrottled worker",
+        -- Dedicated is explicitly throughput-first. The former 20 ms slice
+        -- processed a version migration at ~440 files/s, about one third of
+        -- the established scan rate, while still yielding every UI frame.
+        budget = 73728, time_slice = 0.060,
+        finalize_budget = 98304, finalize_slice = 0.060,
     },
 }
 
@@ -2965,6 +2979,24 @@ local function EnsureDatabaseWorkerStarted(target_path)
         return false
     end
     if r.RecursiveCreateDirectory then r.RecursiveCreateDirectory(queue, 0) end
+    -- The on-disk protocol heartbeat is authoritative. A completed CLI read or
+    -- cancellation can clear Lua's launch bookkeeping while the persistent
+    -- worker remains healthy. Re-adopt that worker instead of deleting its
+    -- readiness file and launching a duplicate that can only lose worker.lock.
+    if database.worker_ready_path then
+        local ready = io.open(database.worker_ready_path, "rb")
+        local ready_text = ready and (ready:read("*a") or "") or ""
+        if ready then ready:close() end
+        local heartbeat, protocol = ready_text:match("^(%d+)|(%d+)|")
+        if tonumber(protocol) == DATABASE_WORKER_PROTOCOL_VERSION
+            and tonumber(heartbeat)
+            and os.time() - tonumber(heartbeat) <= 5 then
+            database.worker_started = true
+            database.worker_unready_since = nil
+            database.worker_status = "adopted live worker heartbeat"
+            return true
+        end
+    end
     if database.worker_started then return true end
     -- Publish ownership before launching. A fast worker can reach its first
     -- heartbeat check before the next deferred Lua frame.
@@ -3016,7 +3048,7 @@ end
 
 local function IsDatabaseWorkerReady()
     local database = state.database
-    if not database.worker_started or not database.worker_ready_path then
+    if not database.worker_ready_path then
         return false
     end
     local ready = io.open(database.worker_ready_path, "rb")
@@ -3035,7 +3067,12 @@ local function IsDatabaseWorkerReady()
             tostring(protocol or "legacy"), DATABASE_WORKER_PROTOCOL_VERSION)
         return false
     end
-    return heartbeat ~= nil and os.time() - heartbeat <= 5
+    local healthy = heartbeat ~= nil and os.time() - heartbeat <= 5
+    if healthy then
+        database.worker_started = true
+        database.worker_unready_since = nil
+    end
+    return healthy
 end
 
 function StartDatabaseWorkerAsync(sql, target_path, request_kind)
@@ -3690,12 +3727,36 @@ function InitializeMediaDatabase()
     end
     -- Use a session-specific queue so a stale worker from a prior script
     -- reload can never consume requests for the current worker protocol.
-    database.worker_queue = sidecar_dir .. "/worker_queue_" .. sidecar_token
+    -- A healthy protocol-compatible queue is safe to adopt, however: request
+    -- tokens are unique and the worker serializes them. Reusing it avoids a
+    -- new session waiting behind the previous worker's database-wide lock.
+    local reusable_worker_queue = nil
+    local queue_index = 0
+    while true do
+        local queue_name = r.EnumerateSubdirectories(sidecar_dir, queue_index)
+        if not queue_name then break end
+        queue_index = queue_index + 1
+        if queue_name:match("^worker_queue_") then
+            local candidate = sidecar_dir .. "/" .. queue_name
+            local ready = io.open(candidate .. "/worker.ready", "rb")
+            local ready_text = ready and (ready:read("*a") or "") or ""
+            if ready then ready:close() end
+            local heartbeat, protocol = ready_text:match("^(%d+)|(%d+)|")
+            if tonumber(protocol) == DATABASE_WORKER_PROTOCOL_VERSION
+                and tonumber(heartbeat)
+                and os.time() - tonumber(heartbeat) <= 5 then
+                reusable_worker_queue = candidate
+                break
+            end
+        end
+    end
+    database.worker_queue = reusable_worker_queue
+        or (sidecar_dir .. "/worker_queue_" .. sidecar_token)
     database.worker_ready_path = database.worker_queue .. "/worker.ready"
     database.worker_owner_path = database.worker_queue .. "/owner.ready"
     database.worker_launcher_path = sidecar_dir .. "/ReaBrowse_Worker_"
         .. sidecar_token .. ".vbs"
-    database.worker_started = false
+    database.worker_started = reusable_worker_queue ~= nil
     database.worker_active = false
     database.worker_restart_pending = false
     database.worker_restart_requested_at = 0
@@ -3706,7 +3767,16 @@ function InitializeMediaDatabase()
     database.worker_owner_last_write = nil
     -- Defer the cold launch until after the first window exists. The process
     -- is then ready before the user opens their first folder.
-    database.worker_prewarm_requested = true
+    database.worker_prewarm_requested = reusable_worker_queue == nil
+    if reusable_worker_queue then
+        local owner = io.open(database.worker_owner_path, "wb")
+        if owner then
+            owner:write(tostring(os.time()), "\n")
+            owner:close()
+            database.worker_owner_last_write = r.time_precise()
+        end
+        database.worker_status = "adopted warm worker"
+    end
     database.pending_init = true
     database.status = "Database init deferred (will complete after window opens)"
     return true
@@ -4503,11 +4573,16 @@ local function BuildCanonicalUnifiedMatchCTE(
             and seed_count >= math.max(1000, library_count / 1000)
             and (not folder_id or (folder_count
                 and folder_count > SMALL_MATERIALIZED_FOLDER_SCOPE))
-        if (force_random_index and not random_tag_stream)
+        if has_fts_search
+            or (force_random_index and not random_tag_stream)
             or rowid_tag_stream then
             -- Common single tags are fastest as indexed probes against the
             -- random stream. Ordinary filtered pages use the same existence
             -- form when a broad tag would be slower as a materialized source.
+            -- FTS searches must stay driven by file_search: materializing the
+            -- complete selected-tag stream before intersecting it with FTS
+            -- made root + vendor search + tag changes take seconds on large
+            -- libraries, even when the final scoped result was small.
             if rowid_tag_stream then files_source = "files NOT INDEXED " end
             for _, tag_name in ipairs(quoted) do
                 where[#where + 1] =
@@ -7975,6 +8050,23 @@ function ProcessMediaDatabase()
             ApplyCanonicalFavoriteMutationLookup(finish_output)
         elseif pending_kind == "canonical_scan_sync" then
             local sync = state.canonical_scan_sync
+            local metrics = state.library_scan.scan_metrics or {}
+            metrics.commit_seconds = math.max(0, r.time_precise()
+                - (metrics.commit_started_at or r.time_precise()))
+            metrics.sql_ms = tonumber(database.worker_last_sql_ms) or 0
+            metrics.total_seconds = math.max(0, r.time_precise()
+                - (metrics.started_at or r.time_precise()))
+            local metric_text = string.format(
+                "mode=%s;files=%d;discovery=%.3f;ingest=%.3f;prepare=%.3f;commit=%.3f;sql_ms=%d;total=%.3f",
+                tostring(metrics.mode or "unknown"),
+                tonumber(state.canonical_scan_sync.files) or 0,
+                tonumber(metrics.discovery_seconds) or 0,
+                tonumber(metrics.ingest_seconds) or 0,
+                tonumber(metrics.prepare_seconds) or 0,
+                tonumber(metrics.commit_seconds) or 0,
+                tonumber(metrics.sql_ms) or 0,
+                tonumber(metrics.total_seconds) or 0)
+            r.SetExtState(EXT_SECTION, "last_scan_profile", metric_text, true)
             -- Classification evidence may have changed during the import;
             -- never let pre-scan Lua cache entries mask the new inheritance.
             state.media_class_by_path = {}
@@ -13668,9 +13760,17 @@ local function StartCanonicalScanManifest()
     sync.current_auto_tag_roots = {}
     if state.database.canonical and FileExists(GetCanonicalDatabasePath()) then
         local output = QueryDatabaseScalarAtPath(GetCanonicalDatabasePath(),
-            "SELECT substr(key,18) FROM app_meta WHERE key LIKE "
-                .. "'auto_tag_version:%' AND CAST(value AS INTEGER)>="
-                .. tostring(AUTO_TAG_VERSION) .. ";")
+            "SELECT substr(meta.key,18) FROM app_meta AS meta WHERE meta.key LIKE "
+                .. "'auto_tag_version:%' AND CAST(meta.value AS INTEGER)>="
+                .. tostring(AUTO_TAG_VERSION)
+                .. " AND (NOT EXISTS(SELECT 1 FROM roots JOIN folder_files "
+                .. "ON folder_files.root_id=roots.id WHERE roots.path_norm="
+                .. "substr(meta.key,18) AND folder_files.missing=0) OR EXISTS("
+                .. "SELECT 1 FROM roots JOIN folder_files ON folder_files.root_id="
+                .. "roots.id JOIN file_tags ON file_tags.file_id="
+                .. "folder_files.file_id WHERE roots.path_norm=substr(meta.key,18) "
+                .. "AND folder_files.missing=0 AND file_tags.source IN"
+                .. "('filename','folder') LIMIT 1));")
         for root_key in tostring(output or ""):gmatch("[^\r\n]+") do
             sync.current_auto_tag_roots[NormalizeFavoritePath(root_key)] = true
         end
@@ -13822,6 +13922,13 @@ StartCanonicalScanImport = function()
         or state.database.write_active then
         return false
     end
+    local metrics = state.library_scan.scan_metrics or {}
+    state.library_scan.scan_metrics = metrics
+    metrics.prepare_seconds = math.max(0, r.time_precise()
+        - (metrics.ingest_started_at or metrics.discovery_started_at
+            or metrics.started_at or r.time_precise())
+        - (metrics.ingest_seconds or 0))
+    metrics.commit_started_at = r.time_precise()
     local manifest = sync.manifest_path:gsub("\\", "/"):gsub('"', '""')
     local now = os.time()
     local platform = r.GetOS() or ""
@@ -14125,6 +14232,15 @@ StartCanonicalScanImport = function()
         "root_id FROM scan_roots) AND NOT EXISTS(SELECT 1 FROM ",
         "scan_file_rows AS current WHERE current.root_id=old.root_id AND ",
         "current.relative_path_norm=old.relative_path_norm);\n",
+        -- Step 8 probes removals by membership identity, folder and file.
+        -- Without these indexes a full-library refresh can rescan the entire
+        -- removal delta once per canonical membership and appear hung.
+        "CREATE UNIQUE INDEX scan_removed_locations_path ON ",
+        "scan_removed_locations(root_id,relative_path_norm);\n",
+        "CREATE INDEX scan_removed_locations_folder ON ",
+        "scan_removed_locations(folder_id);\n",
+        "CREATE INDEX scan_removed_locations_file ON ",
+        "scan_removed_locations(file_id);\n",
         progress("memberships", 7, 10,
             "Applying added memberships"),
         "INSERT INTO folder_files(root_id,folder_id,file_id,name_sort,relative_path,",
@@ -14464,19 +14580,19 @@ end
 function StartWorkerLibraryDiscovery(paths)
     local scan = state.library_scan
     local database = state.database
+    r.SetExtState(EXT_SECTION, "last_worker_discovery",
+        "attempt|" .. tostring(os.time()), true)
     if not EnsureDatabaseWorkerStarted(GetCanonicalDatabasePath()) then
+        r.SetExtState(EXT_SECTION, "last_worker_discovery",
+            "start_failed|" .. tostring(database.worker_status or "unknown"), true)
         return false
     end
-    -- worker_started means launch was requested, not that the process opened
-    -- and validated the new database. Publishing discovery before worker.ready
-    -- can orphan the request if a concurrent startup page falls back to SQLite.
-    -- Use the incremental Lua scanner for this update; a later update can use
-    -- the warmed worker once its heartbeat is confirmed.
-    if not IsDatabaseWorkerReady() then
-        database.worker_status =
-            "Database worker is still starting; using incremental discovery."
-        return false
-    end
+    -- Requests are published by atomic rename into a session-owned queue. They
+    -- remain valid while a cold worker opens SQLite, so readiness must not gate
+    -- publication. The old gate repeatedly observed a false-negative heartbeat
+    -- and entered Lua fallback without ever sending a discovery request.
+    scan.discovery_paths = nil
+    scan.worker_wait_started_at = nil
     local queue = database.worker_queue
     if not queue then return false end
     if r.RecursiveCreateDirectory then r.RecursiveCreateDirectory(queue, 0) end
@@ -14509,19 +14625,29 @@ function StartWorkerLibraryDiscovery(paths)
         request[#request + 1] = path
         request[#request + 1] = "\n"
     end
-    local published = PublishDatabaseWorkerRequest(
+    local published, publish_error = PublishDatabaseWorkerRequest(
         request_path, table.concat(request))
-    if not published then return false end
+    if not published then
+        r.SetExtState(EXT_SECTION, "last_worker_discovery",
+            "publish_failed|" .. tostring(publish_error or "unknown"), true)
+        return false
+    end
+    r.SetExtState(EXT_SECTION, "last_worker_discovery",
+        "published|" .. token, true)
     scan.discovery_request_path = request_path
     scan.discovery_result_path = result_path
     scan.discovery_output_path = output_path
     scan.discovery_progress_path = output_path .. ".progress"
     scan.discovery_nodes = {}
     scan.discovery_worker_unready_since = nil
+    scan.discovery_last_progress_at = r.time_precise()
+    scan.discovery_progress_signature = nil
     for _, root in ipairs(scan.roots or {}) do
         scan.discovery_nodes[NormalizeFavoritePath(root.path)] = root
     end
     scan.phase = "worker_discovery"
+    scan.scan_metrics.mode = "worker"
+    scan.scan_metrics.discovery_started_at = r.time_precise()
     scan.phase_label = "Discovering folders and files in background"
     scan.phase_detail = "Database worker is scanning the filesystem"
     return true
@@ -14545,10 +14671,15 @@ local function FallBackFromWorkerLibraryDiscovery(detail)
     scan.discovery_progress_path = nil
     scan.discovery_nodes = nil
     scan.discovery_worker_unready_since = nil
+    scan.discovery_last_progress_at = nil
+    scan.discovery_progress_signature = nil
     scan.phase = "folders"
+    scan.scan_metrics.mode = "lua-fallback"
     scan.phase_label = "Discovering folders"
     scan.phase_detail = detail
         or "Background discovery unavailable; using incremental discovery"
+    r.SetExtState(EXT_SECTION, "last_worker_discovery",
+        "fallback|" .. tostring(scan.phase_detail), true)
     scan.queue_index = 1
     scan.current = nil
 end
@@ -14558,34 +14689,33 @@ function PollWorkerLibraryDiscovery()
     local result = scan.discovery_result_path
         and io.open(scan.discovery_result_path, "rb")
     if not result then
-        if IsDatabaseWorkerReady() then
-            scan.discovery_worker_unready_since = nil
-        else
-            local now = r.time_precise()
-            scan.discovery_worker_unready_since =
-                scan.discovery_worker_unready_since or now
-            if now - scan.discovery_worker_unready_since >= 3 then
-                state.database.worker_started = false
-                state.database.worker_started_at = nil
-                state.database.worker_status =
-                    "Discovery worker stopped; using incremental discovery."
-                FallBackFromWorkerLibraryDiscovery(
-                    "Background worker stopped; continuing in ReaBrowse")
-                return
-            end
-        end
         local progress = scan.discovery_progress_path
             and io.open(scan.discovery_progress_path, "rb")
         if progress then
-            local folders, files = (progress:read("*a") or ""):match(
-                "(%d+)|(%d+)")
+            local folders, files, sequence =
+                (progress:read("*a") or ""):match("(%d+)|(%d+)|?(%d*)")
             progress:close()
+            local signature = tostring(folders) .. "|" .. tostring(files)
+                .. "|" .. tostring(sequence)
+            if signature ~= scan.discovery_progress_signature then
+                scan.discovery_progress_signature = signature
+                scan.discovery_last_progress_at = r.time_precise()
+            end
             scan.discovered_folders = tonumber(folders)
                 or scan.discovered_folders
             scan.discovered_files = tonumber(files) or scan.discovered_files
             scan.phase_detail = string.format(
                 "%d folders, %d media files discovered",
                 scan.discovered_folders or 0, scan.discovered_files or 0)
+        end
+        -- A live discovery request owns its queue entry and publishes progress
+        -- from inside directory enumeration. Heartbeat reads can false-negative
+        -- during atomic replacement; cancel only on sustained lack of actual
+        -- scan progress, never merely because one readiness read failed.
+        if r.time_precise() - (scan.discovery_last_progress_at
+                or r.time_precise()) >= 15 then
+            FallBackFromWorkerLibraryDiscovery(
+                "Background scanner made no progress for 15 seconds")
         end
         return
     end
@@ -14597,13 +14727,22 @@ function PollWorkerLibraryDiscovery()
     local _, status, _, payload = response:match(
         "^([^\t]*)\t([^\t]*)\t([^\t]*)\t?(.*)$")
     if status ~= "ok" then
+        r.SetExtState(EXT_SECTION, "last_worker_discovery",
+            "response_error|" .. tostring(DecodeWorkerPayload(payload or response)), true)
         FallBackFromWorkerLibraryDiscovery(
             "Background discovery failed; using incremental discovery")
         return
     end
     local folders, files = DecodeWorkerPayload(payload):match(
         "^(%d+)|(%d+)|")
+    r.SetExtState(EXT_SECTION, "last_worker_discovery",
+        "completed|folders=" .. tostring(folders or "?")
+            .. "|files=" .. tostring(files or "?"), true)
     scan.discovered_folders = tonumber(folders) or scan.discovered_folders
+    scan.scan_metrics.discovery_seconds = math.max(0,
+        r.time_precise() - (scan.scan_metrics.discovery_started_at
+            or scan.started_at or r.time_precise()))
+    scan.scan_metrics.ingest_started_at = r.time_precise()
     scan.discovered_files = 0
     scan.discovery_processed_files = 0
     scan.phase_total = tonumber(files) or 0
@@ -14626,9 +14765,12 @@ function ProcessWorkerLibraryDiscovery()
     local profile = GetLibraryScanSpeedProfile()
     local budget = math.max(128, profile.budget * 2)
     local time_slice = profile.time_slice
-    if state.is_playing or ((r.GetPlayState() or 0) & 1) ~= 0 then
+    if state.scan_speed ~= "turbo"
+        and (state.is_playing or ((r.GetPlayState() or 0) & 1) ~= 0) then
         -- Scanning is maintenance; an active preview or arrangement transport
         -- gets virtually the whole GUI frame and audio scheduling window.
+        -- Dedicated is the explicit throughput-first profile and must not be
+        -- silently reduced to the Background ingestion slice by Auto Play.
         budget = math.min(budget, 128)
         time_slice = math.min(time_slice, 0.001)
     end
@@ -14654,6 +14796,9 @@ function ProcessWorkerLibraryDiscovery()
             scan.discovery_output_path = nil
             scan.discovery_progress_path = nil
             scan.discovery_nodes = nil
+            scan.scan_metrics.ingest_seconds = math.max(0,
+                r.time_precise() - (scan.scan_metrics.ingest_started_at
+                    or r.time_precise()))
             StartLibraryFinalize()
             return
         end
@@ -14748,6 +14893,12 @@ function StartLibraryScan(only_root, newly_added)
     scan.browser_blocked = not (state.database.canonical
         and (tonumber(state.database.library_file_count) or 0) > 0)
     scan.started_at = r.time_precise()
+    scan.scan_metrics = {
+        mode = "lua-fallback",
+        started_at = scan.started_at,
+        discovery_started_at = scan.started_at,
+    }
+    scan.worker_relaunch_attempted = false
     scan.phase_started_at = scan.started_at
     scan.phase_done = 0
     scan.phase_total = 0
@@ -14853,7 +15004,11 @@ function CancelLibraryScan()
     scan.discovery_output_path = nil
     scan.discovery_progress_path = nil
     scan.discovery_nodes = nil
+    scan.discovery_last_progress_at = nil
+    scan.discovery_progress_signature = nil
     scan.discovery_worker_unready_since = nil
+    scan.discovery_paths = nil
+    scan.worker_wait_started_at = nil
     scan.scanning = false
     scan.phase = nil
     scan.browser_blocked = false
@@ -30544,11 +30699,6 @@ function LazyPostWindowInit()
                 USAGE_MOST_USED_RETENTION_LIMIT,
                 USAGE_RETENTION_PRUNE_THRESHOLD),
             "usage_retention:startup")
-        -- Start the persistent reader before loading the root accordion.
-        -- The first root/folder request can then use an already running
-        -- worker instead of paying its cold process/runtime startup cost.
-        database.worker_prewarm_requested = false
-        EnsureDatabaseWorkerStarted(GetCanonicalDatabasePath())
         LoadMediaUserTags()
         LoadClassificationOverrides()
         LoadKeyOverrides()
@@ -30571,6 +30721,12 @@ function LazyPostWindowInit()
         BuildFavoriteTree(true, true)
         RepairConfiguredRootsFromCanonicalDatabase()
         LoadCanonicalAccordionRoots()
+        -- Launch only after every synchronous startup read, including the root
+        -- accordion load, has finished. Starting before that final query can
+        -- starve the Lua owner heartbeat long enough for a healthy new worker
+        -- to terminate itself as an apparent orphan before the UI loop resumes.
+        database.worker_prewarm_requested = false
+        EnsureDatabaseWorkerStarted(GetCanonicalDatabasePath())
     else
         LoadMediaUserTags()
         -- SQLite is the only supported Library backend. Never make an old,
