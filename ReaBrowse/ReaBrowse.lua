@@ -1,5 +1,5 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc6
+-- @version 1.0.0-rc8
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
@@ -9,10 +9,10 @@
 --   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
 --   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Added conservative tempo detection for loop filenames containing one
---   standalone 50-200 BPM field, while ignoring technical/version tokens.
---   Adding a virtual instrument now assigns all MIDI inputs and channels,
---   record-arms the track, and enables input monitoring.
+--   Added direct ReaDrumXT batch loading from ordered audio selections.
+--   Fixed FX Chain insertion and guarded FX Chain/Track Template insertion
+--   behind deliberate double-clicks.
+--   Improved database-worker startup, locking, adoption, and cold-scan recovery.
 -- @metapackage
 -- @provides
 --   [win64 main] .
@@ -18317,6 +18317,88 @@ function GetSelectedFilePaths(fallback_path)
     return paths
 end
 
+READRUM_BRIDGE_SECTION = "ReaDrumBridge"
+READRUM_BRIDGE_TIMEOUT_SECONDS = 10.0
+
+function NewReaDrumBridgeRequestID()
+    -- Combine wall time, REAPER's high-resolution clock, and a random suffix.
+    -- The acknowledgement is accepted only when this entire value matches.
+    return string.format("reabrowse-%d-%d-%06d", os.time(),
+        math.floor((r.time_precise() % 1) * 1000000),
+        math.random(0, 999999))
+end
+
+function SendSelectedFilesToReaDrum(fallback_path)
+    if state.readrum_bridge_pending then
+        r.ShowMessageBox(
+            "ReaDrum is still processing the previous sample batch.",
+            "ReaBrowse - ReaDrum", 0)
+        return false
+    end
+
+    local paths = GetSelectedFilePaths(fallback_path)
+    if #paths == 0 then return false end
+
+    local project = select(1, r.EnumProjects(-1, ""))
+    if not project then
+        r.ShowMessageBox("No current REAPER project is available.",
+            "ReaBrowse - ReaDrum", 0)
+        return false
+    end
+
+    local request_id = NewReaDrumBridgeRequestID()
+    -- command_id is the request commit marker and must always be written last.
+    r.SetProjExtState(project, READRUM_BRIDGE_SECTION,
+        "command", "load_batch")
+    r.SetProjExtState(project, READRUM_BRIDGE_SECTION,
+        "paths", table.concat(paths, "\n"))
+    r.SetProjExtState(project, READRUM_BRIDGE_SECTION, "pad", "")
+    r.SetProjExtState(project, READRUM_BRIDGE_SECTION,
+        "command_id", request_id)
+
+    state.readrum_bridge_pending = {
+        project = project,
+        id = request_id,
+        submitted_at = r.time_precise(),
+        count = #paths,
+        next_poll_at = 0,
+    }
+    return true
+end
+
+function PollReaDrumBridgeAcknowledgement()
+    local pending = state.readrum_bridge_pending
+    if not pending then return end
+
+    local now = r.time_precise()
+    if now < (pending.next_poll_at or 0) then return end
+    pending.next_poll_at = now + 0.05
+
+    local _, ack_id = r.GetProjExtState(
+        pending.project, READRUM_BRIDGE_SECTION, "ack_id")
+    if ack_id == pending.id then
+        -- ack_id is ReaDrum's acknowledgement commit marker, so read status
+        -- only after the matching ID has become visible.
+        local _, ack_status = r.GetProjExtState(
+            pending.project, READRUM_BRIDGE_SECTION, "ack_status")
+        state.readrum_bridge_pending = nil
+        if ack_status ~= "ok" then
+            r.ShowMessageBox(
+                "ReaDrum rejected the selected sample batch.",
+                "ReaBrowse - ReaDrum", 0)
+        end
+        return
+    end
+
+    if now - pending.submitted_at >= READRUM_BRIDGE_TIMEOUT_SECONDS then
+        state.readrum_bridge_pending = nil
+        r.ShowMessageBox(
+            "ReaDrum did not acknowledge the sample batch. "
+                .. "ReaDrumXT must be open to load samples.",
+            "ReaBrowse - ReaDrum", 0)
+    end
+end
+
 function ClearMediaFileSelection()
     state.cursor_path = nil
     state.cursor_type = nil
@@ -18971,9 +19053,12 @@ function HandleBrowserKeys()
         else
             HandleLeftArrow(idx)
         end
-    elseif imgui.IsKeyPressed(ctx, imgui.Key_Enter, false) then
+    elseif imgui.IsKeyPressed(ctx, imgui.Key_Enter, false)
+        or imgui.IsKeyPressed(ctx, imgui.Key_KeypadEnter, false) then
         if idx then
-            if it.type == "file" then 
+            if it.type == "file" and IsAudioFile(it.path) then
+                SendSelectedFilesToReaDrum(it.path)
+            elseif it.type == "file" then
                 PlayFile(it.path)
             elseif canonical_random_list and it.node
                 and it.node._canonical_row
@@ -21657,6 +21742,21 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
             }
         end
         local selected_paths = GetSelectedFilePaths(filepath)
+        local selected_paths_are_audio = #selected_paths > 0
+        for _, selected_path in ipairs(selected_paths) do
+            if not IsAudioFile(selected_path) then
+                selected_paths_are_audio = false
+                break
+            end
+        end
+        if selected_paths_are_audio then
+            if imgui.MenuItem(ctx, #selected_paths > 1
+                and "Add Selected to ReaDrum"
+                or "Add to ReaDrum") then
+                SendSelectedFilesToReaDrum(filepath)
+            end
+            imgui.Separator(ctx)
+        end
         if #selected_paths == 1 and IsAudioFile(selected_paths[1]) then
             local cartridge_accent = state.resolved_theme
                 and state.resolved_theme.accent or state.theme.colors.accent
@@ -26887,24 +26987,97 @@ function ScanTrackTemplateDirectory(path)
     return node
 end
 
+function FindTrackChunkBlockClosingLine(chunk, block_name)
+    local block_start = chunk:find("<" .. block_name .. "[%s\r\n]")
+    if not block_start then return nil end
+    local depth, position = 0, block_start
+    while position <= #chunk do
+        local newline = chunk:find("\n", position, true)
+        local line_end = newline and newline - 1 or #chunk
+        local line = chunk:sub(position, line_end):gsub("\r$", "")
+        if line:match("^%s*<") then
+            depth = depth + 1
+        elseif line:match("^%s*>%s*$") then
+            depth = depth - 1
+            if depth == 0 then return position end
+        end
+        if not newline then break end
+        position = newline + 1
+    end
+    return nil
+end
+
+function BuildTrackChunkWithAppendedFXChain(track_chunk, chain_chunk)
+    if not track_chunk or track_chunk == ""
+        or not chain_chunk or chain_chunk == "" then return nil end
+    chain_chunk = chain_chunk:gsub("^%s+", ""):gsub("%s+$", "")
+    if chain_chunk == "" or not chain_chunk:find("^REQUIRED_CHANNELS%s+%d+")
+        and not chain_chunk:find("^BYPASS%s+") then
+        return nil
+    end
+
+    local fx_close = FindTrackChunkBlockClosingLine(track_chunk, "FXCHAIN")
+    if fx_close then
+        return track_chunk:sub(1, fx_close - 1)
+            .. chain_chunk .. "\n" .. track_chunk:sub(fx_close)
+    end
+
+    local track_close_newline = track_chunk:match("()\n>%s*$")
+    if not track_close_newline then return nil end
+    local new_fx_chain = "<FXCHAIN\nSHOW 0\nLASTSEL 0\nDOCKED 0\n"
+        .. chain_chunk .. "\n>\n"
+    return track_chunk:sub(1, track_close_newline)
+        .. new_fx_chain .. track_chunk:sub(track_close_newline + 1)
+end
+
 function AddFXChainToTrack(chain, track)
     track = track or r.GetSelectedTrack(0, 0)
     if not track then
         state.fx_browser.status = "Select a track, then add the FX Chain."
         return false
     end
+    if not chain or not chain.path or chain.path == "" then
+        state.fx_browser.status = "The FX Chain file is unavailable."
+        return false
+    end
+
+    local file, open_error = io.open(chain.path, "rb")
+    if not file then
+        state.fx_browser.status = "Could not read FX Chain: "
+            .. tostring(open_error or chain.name)
+        return false
+    end
+    local chain_chunk = file:read("*a")
+    file:close()
+
+    local got_chunk, original_chunk = r.GetTrackStateChunk(track, "", false)
+    if not got_chunk or not original_chunk or original_chunk == "" then
+        state.fx_browser.status = "REAPER could not read the selected track."
+        return false
+    end
+    local updated_chunk = BuildTrackChunkWithAppendedFXChain(
+        original_chunk, chain_chunk)
+    if not updated_chunk then
+        state.fx_browser.status = "Invalid FX Chain file: " .. chain.name
+        return false
+    end
+
+    local before = r.TrackFX_GetCount(track)
     r.Undo_BeginBlock()
-    local index = r.TrackFX_AddByName(track, "FXCHAIN:" .. chain.path, false, -1)
-    if index < 0 then
-        index = r.TrackFX_AddByName(track, chain.path, false, -1)
+    local applied = r.SetTrackStateChunk(track, updated_chunk, false)
+    local after = applied and r.TrackFX_GetCount(track) or before
+    if not applied or after <= before then
+        if applied then r.SetTrackStateChunk(track, original_chunk, false) end
+        r.Undo_EndBlock("Add FX Chain failed: " .. chain.name, -1)
+        state.fx_browser.status = "REAPER could not add FX Chain: " .. chain.name
+        return false
     end
     r.Undo_EndBlock("Add FX Chain: " .. chain.name, -1)
-    if index >= 0 then
-        state.fx_browser.status = "Added FX Chain: " .. chain.name
-        return true
-    end
-    state.fx_browser.status = "REAPER could not add FX Chain: " .. chain.name
-    return false
+    r.TrackList_AdjustWindows(false)
+    r.UpdateArrange()
+    state.fx_browser.status = string.format("Added FX Chain: %s (%d FX)",
+        chain.name, after - before)
+    return true
 end
 
 function InsertTrackTemplate(template)
@@ -26932,8 +27105,10 @@ function DrawFXChainNode(node, is_root)
     if open then
         for _, folder in ipairs(node.folders) do DrawFXChainNode(folder, false) end
         for index, chain in ipairs(node.files) do
-            if imgui.Selectable(
-                ctx, chain.name .. "##fx_chain_" .. chain.path, false) then
+            imgui.Selectable(
+                ctx, chain.name .. "##fx_chain_" .. chain.path, false)
+            if imgui.IsItemHovered(ctx)
+                and imgui.IsMouseDoubleClicked(ctx, 0) then
                 AddFXChainToTrack(chain)
             end
             if imgui.BeginPopupContextItem(
@@ -26959,9 +27134,11 @@ function DrawTrackTemplateNode(node, is_root)
             DrawTrackTemplateNode(folder, false)
         end
         for index, template in ipairs(node.files) do
-            if imgui.Selectable(
+            imgui.Selectable(
                 ctx, template.name .. "##track_template_" .. template.path,
-                false) then
+                false)
+            if imgui.IsItemHovered(ctx)
+                and imgui.IsMouseDoubleClicked(ctx, 0) then
                 InsertTrackTemplate(template)
             end
             if imgui.BeginPopupContextItem(
@@ -26994,7 +27171,8 @@ function CollectPresetTreeMatches(node, query, results)
     return results
 end
 
-function DrawFXPresetSearchGroup(label, id, items, activate)
+function DrawFXPresetSearchGroup(label, id, items, activate,
+    require_double_click)
     if #items == 0 then return end
     local folder_color = state.resolved_theme
         and state.resolved_theme.folder_text
@@ -27003,9 +27181,14 @@ function DrawFXPresetSearchGroup(label, id, items, activate)
     imgui.Text(ctx, label)
     imgui.PopStyleColor(ctx)
     for index, item in ipairs(items) do
-        if imgui.Selectable(
+        local clicked = imgui.Selectable(
             ctx, item.name .. "##" .. id .. "_search_"
-                .. tostring(index) .. "_" .. item.path, false) then
+                .. tostring(index) .. "_" .. item.path, false)
+        local activated = require_double_click
+            and imgui.IsItemHovered(ctx)
+            and imgui.IsMouseDoubleClicked(ctx, 0)
+            or not require_double_click and clicked
+        if activated then
             activate(item)
         end
     end
@@ -27457,10 +27640,10 @@ function DrawFXBrowser()
                 if #fx.filtered_items > 0 then imgui.Separator(ctx) end
                 DrawFXPresetSearchGroup(
                     "FX CHAINS", "fx_chain", chain_matches,
-                    AddFXChainToTrack)
+                    AddFXChainToTrack, true)
                 DrawFXPresetSearchGroup(
                     "TRACK TEMPLATES", "track_template", template_matches,
-                    InsertTrackTemplate)
+                    InsertTrackTemplate, true)
                 if #fx.filtered_items == 0 and #chain_matches == 0
                     and #template_matches == 0 then
                     imgui.TextDisabled(
@@ -30084,6 +30267,9 @@ end
 
 function Loop()
     state.ui_frame_index = (state.ui_frame_index or 0) + 1
+    -- Loop itself is scheduled with reaper.defer, so bridge acknowledgement
+    -- polling remains asynchronous and never blocks REAPER's UI thread.
+    PollReaDrumBridgeAcknowledgement()
     PublishWorkerOwnerHeartbeat()
     -- A persistent worker only removes process/SQLite startup. Consume an
     -- already-published page before ImGui builds the folder tree, otherwise
