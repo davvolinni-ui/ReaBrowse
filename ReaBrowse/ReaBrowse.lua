@@ -1,5 +1,5 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc8
+-- @version 1.0.0-rc9
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
@@ -9,10 +9,9 @@
 --   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
 --   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Added direct ReaDrumXT batch loading from ordered audio selections.
---   Fixed FX Chain insertion and guarded FX Chain/Track Template insertion
---   behind deliberate double-clicks.
---   Improved database-worker startup, locking, adoption, and cold-scan recovery.
+--   Added configurable native external dragging and one-shot drag behavior.
+--   Improved folder-row contrast and resizable media preview panels.
+--   Updated the native audio preview companion.
 -- @metapackage
 -- @provides
 --   [win64 main] .
@@ -379,6 +378,11 @@ local state = {
     native_companion_version = 0,
     native_drag_available = false,
     native_drag_alt_latched = false,
+    external_drag_default_native = false,
+    one_shot_native_drag = false,
+    pending_file_drag_native = false,
+    file_drag_handed_off = false,
+    drag_paths = nil,
     win_x = 0, win_y = 0, win_w = 0, win_h = 0,
     active_main_tab = "media",
     fx_browser = {
@@ -3842,12 +3846,13 @@ local function ClearReaBrowseSettings()
         "loop_preview", "tempo_match_enabled", "one_shot_mode",
         "scan_speed",
         "audio_auto_one_shot", "one_shot_bypass_sync",
+        "external_drag_default_native", "one_shot_native_drag",
         "one_shot_bypass_loop", "one_shot_bypass_tempo_match",
         "one_shot_bypass_key_sync", "one_shot_bypass_playrate",
         "randomize_on", "playrate", "pitch_shift", "audio_volume_db",
         "audio_route_mode", "audio_route_output_channel",
         "audio_route_output_mono", "media_tag_bar_open", "tag_sort_mode",
-        "piano_open",
+        "piano_open", "media_tag_height",
         "favorite_sort", "show_favorite_column",
         "theme_use_custom", "theme_window_bg",
         "theme_panel_bg", "theme_text", "theme_selected_text", "theme_accent",
@@ -12499,6 +12504,8 @@ function SaveSettings()
     PersistSetting("tempo_match_enabled",
         state.tempo_match_enabled and "1" or "0")
     PersistSetting("one_shot_mode", state.one_shot_mode and "1" or "0")
+    PersistSetting("external_drag_default_native", state.external_drag_default_native and "1" or "0")
+    PersistSetting("one_shot_native_drag", state.one_shot_native_drag and "1" or "0")
     PersistSetting("scan_speed", state.scan_speed or "balanced")
     PersistSetting("audio_auto_one_shot",
         state.audio_auto_one_shot and "1" or "0")
@@ -12524,6 +12531,7 @@ function SaveSettings()
         state.audio_route_output_mono and "1" or "0")
     PersistSetting("media_tag_bar_open",
         state.media_tag_bar.open and "1" or "0")
+    PersistSetting("media_tag_height", state.media_tag_bar.height or "")
     PersistSetting("tag_sort_mode", state.tag_sort_mode or "count")
     PersistSetting("piano_open", state.piano_open and "1" or "0")
     PersistSetting("favorite_sort", state.favorite_sort)
@@ -12606,6 +12614,8 @@ function LoadSettings()
     state.tempo_match_enabled =
         r.GetExtState(EXT_SECTION, "tempo_match_enabled") == "1"
     state.one_shot_mode = r.GetExtState(EXT_SECTION, "one_shot_mode") == "1"
+    state.external_drag_default_native = r.GetExtState(EXT_SECTION, "external_drag_default_native") == "1"
+    state.one_shot_native_drag = r.GetExtState(EXT_SECTION, "one_shot_native_drag") == "1"
     local saved_scan_speed = r.GetExtState(EXT_SECTION, "scan_speed")
     if LIBRARY_SCAN_SPEEDS[saved_scan_speed] then
         state.scan_speed = saved_scan_speed
@@ -12648,6 +12658,7 @@ function LoadSettings()
         r.GetExtState(EXT_SECTION, "audio_route_output_mono") == "1"
     state.media_tag_bar.open =
         r.GetExtState(EXT_SECTION, "media_tag_bar_open") ~= "0"
+    state.media_tag_bar.height = tonumber(r.GetExtState(EXT_SECTION, "media_tag_height"))
     local saved_tag_sort = r.GetExtState(EXT_SECTION, "tag_sort_mode")
     if saved_tag_sort == "az" or saved_tag_sort == "count" then
         state.tag_sort_mode = saved_tag_sort
@@ -12824,6 +12835,38 @@ function EnsureReadableText(foreground, background, minimum_delta)
         return foreground
     end
     return ColorLuminance(background) >= 128 and 0x181818FF or 0xEEEEEEFF
+end
+
+function PushBrowserFolderRowStyle(selected)
+    local palette = ResolveREAPERThemePalette()
+    local text_color = selected and GetSelectedTextColor()
+        or GetFolderTextColor()
+    -- Folder labels intentionally use an accent color, but that accent can be
+    -- almost identical to the selection/hover fill in some REAPER themes.
+    -- Keep the configured label color at rest and move only the interaction
+    -- fills far enough away from the active text color to remain legible.
+    local header = EnsureColorContrast(
+        palette.selection, text_color, 96)
+    local hovered = EnsureColorContrast(
+        palette.header_hover, text_color, 96)
+    local active = EnsureColorContrast(
+        palette.header_active, text_color, 96)
+    imgui.PushStyleColor(ctx, imgui.Col_Text, text_color)
+    imgui.PushStyleColor(ctx, imgui.Col_HeaderHovered, hovered)
+    imgui.PushStyleColor(ctx, imgui.Col_HeaderActive, active)
+    if selected then imgui.PushStyleColor(ctx, imgui.Col_Header, header) end
+    return selected and 4 or 3
+end
+
+function PopBrowserFolderRowStyle(count)
+    imgui.PopStyleColor(ctx, count or 3)
+end
+
+function DrawBrowserFolderTreeNode(label, flags, selected)
+    local count = PushBrowserFolderRowStyle(selected == true)
+    local open = imgui.TreeNode(ctx, label, flags or FLG_SPAN_WIDTH)
+    PopBrowserFolderRowStyle(count)
+    return open
 end
 
 function ResolveREAPERThemePalette()
@@ -19264,6 +19307,24 @@ function DrawOneShotBypassSetting(label, key, detail)
 end
 
 function DrawOneShotModeSettings()
+    local drag_changed, native_default = imgui.Checkbox(ctx,
+        "Native file drag by default (Alt: transformed timeline drag)",
+        state.external_drag_default_native)
+    if drag_changed then
+        state.external_drag_default_native = native_default
+        SaveSettings()
+    end
+    local shot_changed, shot_native = imgui.Checkbox(ctx,
+        "Use native drag for audio one-shots (Alt: transformed)",
+        state.one_shot_native_drag)
+    if shot_changed then
+        state.one_shot_native_drag = shot_native
+        SaveSettings()
+    end
+    if imgui.IsItemHovered(ctx) then
+        imgui.SetTooltip(ctx, "Applies when One-Shot Mode is enabled and every dragged file is classified as an audio one-shot. Mixed selections use the general drag default.")
+    end
+    imgui.Spacing(ctx)
     local audio_changed, audio_enabled = imgui.Checkbox(
         ctx, "One-Shot Mode", state.audio_auto_one_shot)
     if audio_changed then
@@ -20438,6 +20499,61 @@ local function DrawMediaTagButton(
     if pushed_colors > 0 then imgui.PopStyleColor(ctx, pushed_colors) end
 end
 
+-- Native button capture keeps divider gestures separate from deferred row clicks.
+-- Store only on release, so dragging does not write settings every frame.
+function DrawMediaPanelDivider(id, value, minimum, maximum, direction, setting, panel_x, panel_width)
+    if panel_x then imgui.SetCursorPosX(ctx, panel_x) end
+    local width = math.max(1, panel_width or select(1, imgui.GetContentRegionAvail(ctx)))
+    local accent = state.resolved_theme and state.resolved_theme.accent
+        or state.theme.colors.accent
+    imgui.PushStyleColor(ctx, imgui.Col_Button, (accent & 0xFFFFFF00) | 0x18)
+    imgui.PushStyleColor(ctx, imgui.Col_ButtonHovered, (accent & 0xFFFFFF00) | 0x60)
+    imgui.PushStyleColor(ctx, imgui.Col_ButtonActive, (accent & 0xFFFFFF00) | 0x90)
+    imgui.PushStyleVar(ctx, imgui.StyleVar_FramePadding, 0, 0)
+    imgui.PushStyleVar(ctx, imgui.StyleVar_ItemSpacing, 0, 1)
+    imgui.Button(ctx, id, width, 5)
+    imgui.PopStyleVar(ctx, 2)
+    imgui.PopStyleColor(ctx, 3)
+    local hovered = imgui.IsItemHovered(ctx)
+    local active = imgui.IsItemActive(ctx)
+    local x1, y1 = imgui.GetItemRectMin(ctx)
+    local x2, y2 = imgui.GetItemRectMax(ctx)
+    local center_x, center_y = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+    local text_color = state.resolved_theme and state.resolved_theme.text
+        or state.theme.colors.text
+    local grip_color = (hovered or active) and accent
+        or ((text_color & 0xFFFFFF00) | 0xB0)
+    local draw = imgui.GetWindowDrawList(ctx)
+    local grip_half = math.min(18, width * 0.25)
+    for offset = -1, 1, 2 do
+        imgui.DrawList_AddLine(draw, center_x - grip_half, center_y + offset,
+            center_x + grip_half, center_y + offset, grip_color, 1.5)
+    end
+    state.media_panel_drag = state.media_panel_drag or {}
+    local drag = state.media_panel_drag
+    if active then
+        CancelPendingMediaRowActivation()
+        local _, mouse_y = imgui.GetMousePos(ctx)
+        if drag.id ~= id then
+            drag.id, drag.start_y, drag.start_value = id, mouse_y, value
+        end
+        value = math.max(minimum, math.min(maximum,
+            drag.start_value + (mouse_y - drag.start_y) * direction))
+        drag.value = value
+    elseif drag.id == id then
+        value = math.max(minimum, math.min(maximum, drag.value or value))
+        r.SetExtState(EXT_SECTION, setting, tostring(value), true)
+        drag.id = nil
+    end
+    if hovered or active then
+        if imgui.SetMouseCursor and imgui.MouseCursor_ResizeNS then
+            imgui.SetMouseCursor(ctx, imgui.MouseCursor_ResizeNS)
+        end
+        if hovered and not active then imgui.SetTooltip(ctx, "Drag to resize") end
+    end
+    return value
+end
+
 function DrawMediaTagBar()
     local bar = state.media_tag_bar
     local database_mode = state.database_startup_test.enabled
@@ -20773,9 +20889,26 @@ function DrawMediaTagBar()
 
     local tags = database_mode
         and (canonical.available_tags or {}) or GetRelevantMediaTags()
-    local tag_area_height = imgui.GetTextLineHeightWithSpacing(ctx) * 5 + 8
+    local default_height = imgui.GetTextLineHeightWithSpacing(ctx) * 5 + 8
+    local available_height = select(2, imgui.GetContentRegionAvail(ctx))
+    local tag_minimum = imgui.GetTextLineHeightWithSpacing(ctx) + 8
+    local tag_maximum = math.max(tag_minimum, available_height - 220)
+    local tag_area_height = math.max(tag_minimum,
+        math.min(tag_maximum, bar.height or default_height))
+    local tag_panel_x = imgui.GetCursorPosX(ctx)
+    -- ContentRegionAvail can retain a wider content extent after narrowing
+    -- the window. Bound this child to the current visible window instead.
+    local visible_width = select(1, imgui.GetWindowSize(ctx))
+    local tag_panel_width = math.max(1, math.min(
+        select(1, imgui.GetContentRegionAvail(ctx)),
+        visible_width - tag_panel_x - math.max(8, tag_panel_x)))
+    local tag_panel_left, tag_panel_right
+    imgui.PushStyleVar(ctx, imgui.StyleVar_ItemSpacing, 0, 1)
     if imgui.BeginChild(
-        ctx, "##media_tag_facets", 0, tag_area_height, 0, 0) then
+        ctx, "##media_tag_facets", tag_panel_width, tag_area_height, 0, 0) then
+        local child_x = select(1, imgui.GetWindowPos(ctx))
+        local child_width = select(1, imgui.GetWindowSize(ctx))
+        tag_panel_left, tag_panel_right = child_x, child_x + child_width
         local tag_line_width = select(1, imgui.GetContentRegionAvail(ctx))
         if state.media_tag_facets.building then
             imgui.TextDisabled(ctx, string.format(
@@ -20838,7 +20971,16 @@ function DrawMediaTagBar()
         end
         imgui.EndChild(ctx)
     end
-    imgui.Separator(ctx)
+    imgui.PopStyleVar(ctx)
+    -- Use the tag child's actual bounds, not a content width affected by
+    -- other controls or horizontal scrolling in the parent window.
+    if tag_panel_left then
+        local screen_x = select(1, imgui.GetCursorScreenPos(ctx))
+        tag_panel_x = imgui.GetCursorPosX(ctx) + tag_panel_left - screen_x
+        tag_panel_width = tag_panel_right - tag_panel_left
+    end
+    bar.height = DrawMediaPanelDivider("##tag_panel_resize", tag_area_height,
+        tag_minimum, tag_maximum, 1, "media_tag_height", tag_panel_x, tag_panel_width)
 end
 
 function RevealFileInExplorer(filepath)
@@ -21566,6 +21708,26 @@ function IsMediaFileRowHovered(node, row_key)
 end
 
 local browser_row_interaction = {}
+-- Resolve the external protocol once at mouse-down, using the gesture's
+-- selection rather than the currently loaded preview. Alt always inverts it.
+function ResolveFileDragNative(paths, alt)
+    local native = state.external_drag_default_native == true
+    if state.one_shot_native_drag and state.audio_auto_one_shot
+        and #paths > 0 then
+        local all_one_shots = true
+        for _, path in ipairs(paths) do
+            if not IsAudioFile(path)
+                or ResolveEffectiveMediaClass(path) ~= "one-shot" then
+                all_one_shots = false
+                break
+            end
+        end
+        if all_one_shots then native = true end
+    end
+    if alt then native = not native end
+    return native
+end
+
 local function CaptureBrowserRowInteraction(row_key)
     if state.block_browser_input then
         local interaction = browser_row_interaction
@@ -21607,6 +21769,10 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
         state.accordion_page_load_suppressed = true
     end
     if not suppress_click and interaction.clicked then
+        -- Only a new physical press can re-arm a gesture consumed by OLE.
+        -- Its queued drag loop can leave this ImGui row active across frames.
+        state.file_drag_handed_off = false
+        GetMediaClass(file_node)
         local ctrl = interaction.ctrl == true
         local shift = interaction.shift == true
         local row_key = interaction.row_key
@@ -21645,6 +21811,11 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
                 state.selected_file_row_keys = {[filepath] = row_key}
             end
         end
+        local drag_paths = state.multi_selected[filepath]
+            and GetSelectedFilePaths(filepath) or {filepath}
+        state.pending_file_drag_native = ResolveFileDragNative(
+            drag_paths, select(3, GetSelectionModifiers()) == true)
+        state.pending_file_drag_paths = drag_paths
     end
     if interaction.hovered then
         state.next_hovered_path = filepath
@@ -21676,6 +21847,7 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
     end
     
     if not suppress_click
+        and not state.file_drag_handed_off
         and (interaction.active or state.favorite_drag_pending_path == filepath)
         and not state.favorite_heart_press_path
         and imgui.IsMouseDragging(ctx, 0) then
@@ -21701,8 +21873,9 @@ function HandleFileInteraction(file_node, suppress_click, interaction)
             -- Choose the destination protocol at mouse-down. Switching from
             -- the custom Arrange drag to OLE after the gesture has started can
             -- let both paths observe the same mouse release.
-            state.native_drag_alt_latched =
-                select(3, GetSelectionModifiers()) == true
+            state.native_drag_alt_latched = state.pending_file_drag_native
+            state.drag_paths = state.pending_file_drag_paths or {filepath}
+            state.pending_file_drag_paths = nil
             state.favorite_drag_copy = state.favorite_drag_pending_copy
                 or select(1, GetSelectionModifiers())
             state.favorite_drag_source_kind,
@@ -24348,6 +24521,7 @@ function DrawKeyLockPiano()
     }
 
     imgui.InvisibleButton(ctx, "##key_lock_piano", piano_w, piano_h)
+    state.preview_piano_height = select(2, imgui.GetCursorScreenPos(ctx)) - y
     local clicked_pc = nil
     if imgui.IsItemClicked(ctx) then
         local mx, my = imgui.GetMousePos(ctx)
@@ -24513,6 +24687,16 @@ function DrawSmoothValueControl(id, value, min_value, max_value, width, format_v
     return changed, value, committed, wheel_changed
 end
 
+function GetMediaPreviewFooterHeight(font_height)
+    local height = state.preview_footer_height or (font_height * 5 + 75)
+    if state.preview_footer_piano_open ~= nil
+        and state.preview_footer_piano_open ~= state.piano_open then
+        height = height + (state.piano_open and 1 or -1)
+            * (state.preview_piano_height or 54)
+    end
+    return math.max(100, height)
+end
+
 function DrawMIDIPreview()
     local preview_window_flags = FLG_NO_SCROLLBAR | FLG_NO_SCROLL_MOUSE
     if not imgui.BeginChild(
@@ -24544,20 +24728,17 @@ function DrawMIDIPreview()
         CancelPendingMediaRowActivation()
     end
 
+    local preview_caption
     if state.media_kind == "audio" and state.source_file ~= "" then
-        imgui.Text(ctx, GetFileName(state.source_file))
-        imgui.SameLine(ctx)
-        imgui.TextDisabled(ctx, string.format(
-            "| Audio | %.2fs", state.audio_length or 0))
+        preview_caption = GetFileName(state.source_file) .. string.format(
+            " | Audio | %.2fs", state.audio_length or 0)
     elseif state.loaded_midi then
-        imgui.Text(ctx, GetFileName(state.source_file))
-        imgui.SameLine(ctx)
-        imgui.TextDisabled(ctx, string.format("| %d notes | %.2fs",
+        preview_caption = GetFileName(state.source_file) .. string.format(" | %d notes | %.2fs",
             #state.loaded_midi.notes,
             state.loaded_midi.display_duration
-                or state.file_duration_seconds))
+                or state.file_duration_seconds)
     else
-        imgui.TextDisabled(ctx, "Select a MIDI or audio file to preview...")
+        preview_caption = "Select a MIDI or audio file to preview..."
     end
 
     local avail_x, avail_y = imgui.GetContentRegionAvail(ctx)
@@ -24569,11 +24750,14 @@ function DrawMIDIPreview()
     -- pixel block. The canvas absorbs the remainder, keeping the piano flush
     -- with the bottom at every browser font size.
     local font_height = select(2, imgui.CalcTextSize(ctx, "Ag"))
-    local control_reserve = state.preview_footer_height
-        or (font_height * 5 + 75)
+    local control_reserve = GetMediaPreviewFooterHeight(font_height)
     local canvas_h = math.max(40, avail_y - control_reserve)
     local canvas_p0_x, canvas_p0_y = imgui.GetCursorScreenPos(ctx)
     local draw_list = imgui.GetWindowDrawList(ctx)
+    local caption_scale = 0.65
+    local caption_font_size = imgui.GetFontSize(ctx) * caption_scale
+    local caption_height = select(2, imgui.CalcTextSize(ctx, "Ag")) * caption_scale
+    local caption_strip_height = math.min(caption_height + 8, canvas_h * 0.4)
 
     local c_bg = state.theme.use_custom and state.theme.colors.preview_bg
         or GetREAPERThemeColor("col_main_editbk", 0x1A1A1AFF)
@@ -24635,6 +24819,11 @@ function DrawMIDIPreview()
     imgui.DrawList_AddRectFilled(draw_list, canvas_p0_x, canvas_p0_y, canvas_p0_x + avail_x, canvas_p0_y + canvas_h, c_bg)
     imgui.DrawList_AddRect(draw_list, canvas_p0_x, canvas_p0_y, canvas_p0_x + avail_x, canvas_p0_y + canvas_h, c_grid, 0, 0, 1)
 
+    do
+    -- Keep all waveform/notes below the slim caption strip. The enclosing
+    -- canvas and its seek target retain their original dimensions.
+    local canvas_p0_y = canvas_p0_y + caption_strip_height
+    local canvas_h = math.max(1, canvas_h - caption_strip_height)
     if state.media_kind == "audio" and state.audio_peaks
         and #state.audio_peaks > 0 then
         local center_y = canvas_p0_y + canvas_h * 0.5
@@ -24759,6 +24948,17 @@ function DrawMIDIPreview()
         local playhead_x = canvas_p0_x + (preview_pos / time_range) * avail_x
         imgui.DrawList_AddLine(draw_list, playhead_x, canvas_p0_y, playhead_x, canvas_p0_y + canvas_h, 0xFFBB00FF, 2)
     end
+
+    end -- plot area
+
+    -- Caption uses the canvas background directly and never covers the plot.
+    local caption_color = state.resolved_theme and state.resolved_theme.text
+        or state.theme.colors.text
+    imgui.DrawList_PushClipRect(draw_list, canvas_p0_x + 1, canvas_p0_y + 1,
+        canvas_p0_x + avail_x - 1, canvas_p0_y + caption_strip_height, true)
+    imgui.DrawList_AddTextEx(draw_list, nil, caption_font_size,
+        canvas_p0_x + 6, canvas_p0_y + 3, caption_color, preview_caption)
+    imgui.DrawList_PopClipRect(draw_list)
 
     local footer_start_y = canvas_p0_y + canvas_h + 5
     imgui.SetCursorScreenPos(ctx, canvas_p0_x, footer_start_y)
@@ -25019,6 +25219,7 @@ function DrawMIDIPreview()
         or math.abs(state.preview_footer_height - measured_footer) > 0.5 then
         state.preview_footer_height = measured_footer
     end
+    state.preview_footer_piano_open = state.piano_open
 
     imgui.EndChild(ctx)
 end
@@ -25676,6 +25877,50 @@ function AddFXItemsToTrack(items, track, rec_fx, show_chain, insert_index)
     return added > 0
 end
 
+function GetTakeFXDestinationName(take)
+    return take and r.TakeIsMIDI and r.TakeIsMIDI(take)
+        and "MIDI item FX" or "audio item FX"
+end
+
+function AddFXItemsToTake(items, take, show_chain)
+    if not items or #items == 0 then return false end
+    if not take or not r.TakeFX_AddByName then
+        state.fx_browser.status = "Drop on an audio or MIDI item with an active take."
+        return false
+    end
+
+    r.Undo_BeginBlock()
+    local added, last_index = 0, nil
+    for _, item in ipairs(items) do
+        -- A negative instantiate value always creates a fresh instance. This
+        -- is a drop operation, so it must not resolve to an existing plug-in.
+        local fx_index = r.TakeFX_AddByName(take, item.ident, -1)
+        if fx_index < 0 and item.name ~= item.ident then
+            fx_index = r.TakeFX_AddByName(take, item.name, -1)
+        end
+        if fx_index >= 0 then
+            added = added + 1
+            last_index = fx_index
+            RecordFXUse(item, true)
+        end
+    end
+    if added > 0 then SaveFXFavorites() end
+    if last_index and r.TakeFX_Show then
+        r.TakeFX_Show(take, last_index, show_chain and 1 or 3)
+    end
+    local destination = GetTakeFXDestinationName(take)
+    r.Undo_EndBlock("Add " .. destination .. " ("
+        .. tostring(#items) .. " plug-in"
+        .. (#items == 1 and ")" or "s)"), -1)
+    r.UpdateArrange()
+    state.fx_browser.status = added == #items
+        and ("Added " .. tostring(added) .. " plug-in"
+            .. (added == 1 and "" or "s") .. " to " .. destination .. ".")
+        or ("Added " .. tostring(added) .. " of " .. tostring(#items)
+            .. " plug-ins to " .. destination .. ".")
+    return added > 0
+end
+
 function CreateTrackWithFXItems(items, rec_fx)
     if not items or #items == 0 then return false end
     local track_index = r.CountTracks(0)
@@ -25891,6 +26136,44 @@ function GetExplicitFXDropTarget(mouse_x, mouse_y)
     }
 end
 
+function GetFXTakeDropTarget(mouse_x, mouse_y)
+    local take, item
+    if r.GetTakeFromPoint then
+        local ok, found_take = pcall(r.GetTakeFromPoint, mouse_x, mouse_y)
+        if ok then take = found_take end
+    end
+    if r.GetItemFromPoint then
+        local ok, found_item, found_take = pcall(
+            r.GetItemFromPoint, mouse_x, mouse_y, true)
+        if ok then
+            item = found_item
+            take = take or found_take
+        end
+    end
+    if not item and r.BR_GetMouseCursorContext_Item then
+        local ok, found_item = pcall(r.BR_GetMouseCursorContext_Item)
+        if ok then item = found_item end
+    end
+    if not take and r.BR_GetMouseCursorContext_Take then
+        local ok, found_take = pcall(r.BR_GetMouseCursorContext_Take)
+        if ok then take = found_take end
+    end
+    if not take and item and r.GetActiveTake then
+        take = r.GetActiveTake(item)
+    end
+    if not item and take and r.GetMediaItemTake_Item then
+        item = r.GetMediaItemTake_Item(take)
+    end
+    if not take then return nil end
+    local midi = r.TakeIsMIDI and r.TakeIsMIDI(take) or false
+    return {
+        item = item,
+        take = take,
+        kind = "take_fx",
+        region = midi and "midi_item" or "audio_item",
+    }
+end
+
 function GetFXDropTarget(mouse_x, mouse_y)
     local explicit = GetExplicitFXDropTarget(mouse_x, mouse_y)
     if explicit then return explicit end
@@ -25900,6 +26183,10 @@ function GetFXDropTarget(mouse_x, mouse_y)
     if r.BR_GetMouseCursorContext then
         local window = select(1, r.BR_GetMouseCursorContext())
         if window == "arrange" or window == "tcp" or window == "mcp" then
+            if window == "arrange" then
+                local take_target = GetFXTakeDropTarget(mouse_x, mouse_y)
+                if take_target then return take_target end
+            end
             local track = r.BR_GetMouseCursorContext_Track()
             return {
                 track = track,
@@ -25911,6 +26198,9 @@ function GetFXDropTarget(mouse_x, mouse_y)
         end
         return {kind = "invalid", region = window}
     end
+
+    local take_target = GetFXTakeDropTarget(mouse_x, mouse_y)
+    if take_target then return take_target end
 
     if r.GetThingFromPoint then
         local track, info = r.GetThingFromPoint(mouse_x, mouse_y)
@@ -26865,14 +27155,12 @@ end
 
 function DrawFavoriteFXFolder(path, label, depth, cache)
     local fx = state.fx_browser
-    local folder_color = state.resolved_theme
-        and state.resolved_theme.folder_text or state.theme.colors.folder_text
-    imgui.PushStyleColor(ctx, imgui.Col_Text, folder_color)
+    local folder_style_count = PushBrowserFolderRowStyle(false)
     local open = imgui.TreeNode(
         ctx,
         label .. "##fx_fav_folder_" .. path,
         FLG_SPAN_WIDTH)
-    imgui.PopStyleColor(ctx)
+    PopBrowserFolderRowStyle(folder_style_count)
     if fx.drag_active and IsMouseInsideLastItem() then
         fx.favorite_drop_active = true
         fx.favorite_drop_target = path
@@ -27100,8 +27388,8 @@ end
 function DrawFXChainNode(node, is_root)
     local label = is_root and "FX Chains"
         or (node.path:match("([^/\\]+)$") or node.path)
-    local open = is_root or imgui.TreeNode(
-        ctx, label .. "##fx_chain_folder_" .. node.path, FLG_SPAN_WIDTH)
+    local open = is_root or DrawBrowserFolderTreeNode(
+        label .. "##fx_chain_folder_" .. node.path, FLG_SPAN_WIDTH, false)
     if open then
         for _, folder in ipairs(node.folders) do DrawFXChainNode(folder, false) end
         for index, chain in ipairs(node.files) do
@@ -27126,9 +27414,9 @@ end
 function DrawTrackTemplateNode(node, is_root)
     local label = is_root and "Track Templates"
         or (node.path:match("([^/\\]+)$") or node.path)
-    local open = is_root or imgui.TreeNode(
-        ctx, label .. "##track_template_folder_" .. node.path,
-        FLG_SPAN_WIDTH)
+    local open = is_root or DrawBrowserFolderTreeNode(
+        label .. "##track_template_folder_" .. node.path,
+        FLG_SPAN_WIDTH, false)
     if open then
         for _, folder in ipairs(node.folders) do
             DrawTrackTemplateNode(folder, false)
@@ -27234,8 +27522,8 @@ end
 function DrawFXUsageRoot(mode, label)
     local fx = state.fx_browser
     local items = GetFXUsageItems(mode)
-    local open = imgui.TreeNode(
-        ctx, label .. "##fx_usage_" .. mode, FLG_SPAN_WIDTH)
+    local open = DrawBrowserFolderTreeNode(
+        label .. "##fx_usage_" .. mode, FLG_SPAN_WIDTH, false)
     if open then
         if #items == 0 then
             imgui.TextDisabled(ctx, "No plug-ins recorded yet.")
@@ -27263,12 +27551,8 @@ function DrawFXLibraryRoots()
         OpenFXFolderDialog("create_favorite", "", nil)
     end
     imgui.Separator(ctx)
-    local favorites_folder_color = state.resolved_theme
-        and state.resolved_theme.folder_text or state.theme.colors.folder_text
-    imgui.PushStyleColor(ctx, imgui.Col_Text, favorites_folder_color)
-    local favorites_open =
-        imgui.TreeNode(ctx, "♥  Favorites##fx_favorites_root", FLG_SPAN_WIDTH)
-    imgui.PopStyleColor(ctx)
+    local favorites_open = DrawBrowserFolderTreeNode(
+        "♥  Favorites##fx_favorites_root", FLG_SPAN_WIDTH, false)
     if fx.drag_active and IsMouseInsideLastItem() then
         fx.favorite_drop_active = true
         fx.favorite_drop_target = ""
@@ -27310,8 +27594,8 @@ function DrawFXLibraryRoots()
     elseif fx.preset_init_deferred and not fx.chain_tree then
         fx.chain_tree = ScanFXChainDirectory(chain_root)
     end
-    local chains_open =
-        imgui.TreeNode(ctx, "⛓  FX Chains##fx_chains_root", FLG_SPAN_WIDTH)
+    local chains_open = DrawBrowserFolderTreeNode(
+        "⛓  FX Chains##fx_chains_root", FLG_SPAN_WIDTH, false)
     if chains_open then
         if fx.chain_tree then
             DrawFXChainNode(fx.chain_tree, true)
@@ -27328,9 +27612,9 @@ function DrawFXLibraryRoots()
     elseif fx.chain_tree and not fx.track_template_tree then
         fx.template_init_deferred = true
     end
-    local templates_open = imgui.TreeNode(
-        ctx, "\226\150\164  Track Templates##track_templates_root",
-        FLG_SPAN_WIDTH)
+    local templates_open = DrawBrowserFolderTreeNode(
+        "\226\150\164  Track Templates##track_templates_root",
+        FLG_SPAN_WIDTH, false)
     if templates_open then
         if fx.track_template_tree then
             DrawTrackTemplateNode(fx.track_template_tree, true)
@@ -27404,11 +27688,11 @@ function DrawRightAlignedBrowserGroupCount(count, selected, group_label)
     if max_x - min_x < group_w + text_w + 52 then return end
     local theme = state.resolved_theme or state.theme.colors
     local text_color = theme.text or state.theme.colors.text
-    local background = selected
-        and (theme.accent or state.theme.colors.accent)
-        or (theme.panel_bg or state.theme.colors.panel_bg)
-    local count_color = BlendColor(text_color, background,
-        selected and 0.38 or 0.52)
+    local background = theme.panel_bg or state.theme.colors.panel_bg
+    local hovered = imgui.IsItemHovered(ctx)
+    local count_color = selected and GetSelectedTextColor()
+        or (hovered and GetFolderTextColor()
+            or BlendColor(text_color, background, 0.52))
     imgui.DrawList_AddText(
         imgui.GetWindowDrawList(ctx),
         math.max(min_x, max_x - text_w - 8),
@@ -27423,22 +27707,18 @@ function DrawFXFolderView()
         local label = string.format(
             "%s##fx_group_%s_%d",
             group.name, fx.view_mode, group_index)
-        local folder_color = state.resolved_theme
-            and state.resolved_theme.folder_text
-            or state.theme.colors.folder_text
         local was_open = fx.open_group[fx.view_mode] == group.name
         imgui.SetNextItemOpen(ctx, was_open)
-        imgui.PushStyleColor(ctx, imgui.Col_Text, folder_color)
         local flags = FLG_SPAN_WIDTH
         local group_selected = fx.keyboard_cursor_kind == "group"
             and fx.keyboard_group == group.name
         if group_selected then
             flags = flags | imgui.TreeNodeFlags_Selected
         end
-        local open = imgui.TreeNode(ctx, label, flags)
+        local open = DrawBrowserFolderTreeNode(
+            label, flags, group_selected)
         DrawRightAlignedBrowserGroupCount(
             #group.items, group_selected, group.name)
-        imgui.PopStyleColor(ctx)
         if fx.keyboard_scroll_group == group.name then
             imgui.SetScrollHereY(ctx, 0.5)
             fx.keyboard_scroll_group = nil
@@ -27739,7 +28019,7 @@ end
 function ResolveFXDropKind(target, alt)
     if not target then return nil end
     if target.kind == "monitoring_fx" or target.kind == "input_fx"
-        or target.kind == "track_fx" then
+        or target.kind == "track_fx" or target.kind == "take_fx" then
         return target.kind
     end
     if target.kind == "track" then return alt and "input_fx" or "track_fx" end
@@ -27750,6 +28030,7 @@ function GetFXDropKindLabel(kind)
     if kind == "monitoring_fx" then return "Monitoring FX" end
     if kind == "input_fx" then return "Input FX" end
     if kind == "track_fx" then return "Track FX" end
+    if kind == "take_fx" then return "Item / Take FX" end
     return "No FX target"
 end
 
@@ -27796,7 +28077,7 @@ function ProcessFXDrag()
         else
             imgui.Text(ctx, GetFXDropKindLabel(drop_kind))
             imgui.TextDisabled(ctx,
-                "Drop on a track, Track FX, Input FX, or Monitoring FX")
+                "Drop on an audio/MIDI item, track, or FX chain")
             if not (target and target.explicit_chain) then
                 imgui.TextDisabled(ctx,
                     "Alt changes a direct track drop to Input FX")
@@ -27805,7 +28086,10 @@ function ProcessFXDrag()
         imgui.TextDisabled(ctx, #drag_items > 1
             and (tostring(#drag_items) .. " selected plug-ins")
             or fx.drag_item.name)
-        if not fx.favorite_drop_active and target and target.track then
+        if not fx.favorite_drop_active and target and target.take then
+            imgui.TextDisabled(ctx, "Target: "
+                .. GetTakeFXDestinationName(target.take))
+        elseif not fx.favorite_drop_active and target and target.track then
             local _, track_name = r.GetTrackName(target.track)
             local target_name = drop_kind == "monitoring_fx"
                 and "Monitoring FX"
@@ -27838,6 +28122,8 @@ function ProcessFXDrag()
                     .. fx.favorite_drop_target)
                 or ("Added " .. tostring(#drag_items)
                     .. " plug-in(s) to Favorites.")
+        elseif target and target.take and drop_kind == "take_fx" then
+            AddFXItemsToTake(drag_items, target.take, false)
         elseif target and target.track and drop_kind then
             AddFXItemsToTrack(
                 drag_items, target.track, drop_as_input_fx,
@@ -27845,7 +28131,7 @@ function ProcessFXDrag()
         elseif target and target.create_new and outside_browser then
             CreateTrackWithFXItems(drag_items, fx.drag_input_fx)
         elseif outside_browser then
-            fx.status = "Drop cancelled: no REAPER track under the mouse."
+            fx.status = "Drop cancelled: no REAPER item or track under the mouse."
         end
         fx.drag_active = false
         fx.drag_item = nil
@@ -29212,13 +29498,9 @@ function DrawBrowserActionFavoriteFolder(path, cache)
     local actions = state.actions_browser
     local label = path:match("([^/]+)$") or path
     local items = cache.folders[path] or {}
-    local folder_color = state.resolved_theme
-        and state.resolved_theme.folder_text or state.theme.colors.folder_text
-    imgui.PushStyleColor(ctx, imgui.Col_Text, folder_color)
-    local open = imgui.TreeNode(ctx,
+    local open = DrawBrowserFolderTreeNode(
         label .. "##actions_folder_" .. path,
-        FLG_SPAN_WIDTH)
-    imgui.PopStyleColor(ctx)
+        FLG_SPAN_WIDTH, false)
     if actions.drag_active and IsMouseInsideLastItem() then
         actions.favorite_drop_active = true
         actions.favorite_drop_target = path
@@ -29305,12 +29587,9 @@ function DrawActionsLibraryRoots(suppress_browse)
         PromptBrowserActionFavoriteFolder("", nil)
     end
     imgui.Separator(ctx)
-    local favorites_folder_color = state.resolved_theme
-        and state.resolved_theme.folder_text or state.theme.colors.folder_text
-    imgui.PushStyleColor(ctx, imgui.Col_Text, favorites_folder_color)
-    local favorites_open = imgui.TreeNode(
-        ctx, "\xe2\x99\xa5  Favorites##actions_favorites_root", FLG_SPAN_WIDTH)
-    imgui.PopStyleColor(ctx)
+    local favorites_open = DrawBrowserFolderTreeNode(
+        "\xe2\x99\xa5  Favorites##actions_favorites_root",
+        FLG_SPAN_WIDTH, false)
     if actions.drag_active and IsMouseInsideLastItem() then
         actions.favorite_drop_active = true
         actions.favorite_drop_target = ""
@@ -29342,12 +29621,13 @@ function DrawActionsLibraryRoots(suppress_browse)
         DeleteBrowserActionFavoriteFolder(path)
     end
 
-    if imgui.TreeNode(ctx, "Recent##actions_recent", FLG_SPAN_WIDTH) then
+    if DrawBrowserFolderTreeNode(
+        "Recent##actions_recent", FLG_SPAN_WIDTH, false) then
         DrawClippedActionList(cache.recent, nil, "recent", true)
         imgui.TreePop(ctx)
     end
-    if imgui.TreeNode(ctx,
-        "Most Used##actions_used", FLG_SPAN_WIDTH) then
+    if DrawBrowserFolderTreeNode(
+        "Most Used##actions_used", FLG_SPAN_WIDTH, false) then
         DrawClippedActionList(cache.used, nil, "used", true)
         imgui.TreePop(ctx)
     end
@@ -29368,21 +29648,17 @@ function DrawActionsLibraryRoots(suppress_browse)
     for _, group in ipairs(groups) do
         local was_open = actions.open_group[mode] == group.id
         imgui.SetNextItemOpen(ctx, was_open)
-        local folder_color = state.resolved_theme
-            and state.resolved_theme.folder_text or state.theme.colors.folder_text
-        imgui.PushStyleColor(ctx, imgui.Col_Text, folder_color)
         local flags = FLG_SPAN_WIDTH
         local group_selected = actions.keyboard_cursor_kind == "group"
             and actions.keyboard_group == group.id
         if group_selected then
             flags = flags | imgui.TreeNodeFlags_Selected
         end
-        local open = imgui.TreeNode(ctx,
+        local open = DrawBrowserFolderTreeNode(
             string.format("%s##actions_group_%s_%s",
-                group.name, mode, group.id), flags)
+                group.name, mode, group.id), flags, group_selected)
         DrawRightAlignedBrowserGroupCount(
             #group.items, group_selected, group.name)
-        imgui.PopStyleColor(ctx)
         if actions.keyboard_scroll_group == group.id then
             imgui.SetScrollHereY(ctx, 0.5)
             actions.keyboard_scroll_group = nil
@@ -29966,7 +30242,15 @@ function DrawMainTabs()
         DrawMediaTagBar()
         local remaining_h = select(2, imgui.GetContentRegionAvail(ctx))
         local font_height = select(2, imgui.CalcTextSize(ctx, "Ag"))
-        local preview_height = math.max(280, font_height * 6 + 145)
+        local original_preview_height = math.max(280, font_height * 6 + 145)
+        local footer_height = GetMediaPreviewFooterHeight(font_height)
+        -- Normalize to the expanded footer when choosing the canvas height.
+        -- Collapsing the keyboard reduces only the footer reservation.
+        local expanded_footer_height = footer_height
+            + (state.piano_open and 0 or (state.preview_piano_height or 54))
+        local original_canvas_height = math.max(40,
+            original_preview_height - expanded_footer_height - 16)
+        local preview_height = footer_height + 16 + math.max(40, original_canvas_height * 2 / 3)
         local browser_height = math.max(80, remaining_h - preview_height - 4)
         DrawAccordionBrowser(browser_height)
         DrawMIDIPreview()
@@ -30546,16 +30830,16 @@ function Loop()
                 window == "arrange" or window == "tcp"
         end
 
-        -- Normal drags remain under ReaBrowse's control so Arrange insertion
-        -- preserves pitch, tempo matching, key sync, and item length. Holding
-        -- Alt before mouse-down selects Shell-native mode for the full gesture.
+        -- The mouse-down policy owns the full gesture. Internal Favorites
+        -- handling stays custom; native mode hands off only outside the browser.
         if is_outside and state.drag_kind == "file"
             and state.native_drag_alt_latched then
             if not state.favorite_drop_hovered
                 and state.native_drag_available then
                 native_drag_handled = StartNativeExternalFileDrag(
-                    GetSelectedFilePaths(state.drag_path))
+                    state.drag_paths or GetSelectedFilePaths(state.drag_path))
                 if native_drag_handled then
+                    state.file_drag_handed_off = true
                     state.drag_active = false
                     r.SetEditCurPos(state.drag_orig_cursor_pos, false, false)
                     state.favorite_drag_copy = false
@@ -30566,6 +30850,8 @@ function Loop()
                     state.drag_last_pos = nil
                     state.drag_hover_arrange = false
                     state.native_drag_alt_latched = false
+                    state.drag_paths = nil
+                    state.pending_file_drag_paths = nil
                 end
             end
         end
@@ -30580,7 +30866,7 @@ function Loop()
                     and "Sampler/script drop armed"
                     or "Sampler/script drop unavailable")
             else
-                imgui.Text(ctx, "Drop to Arrange View")
+                imgui.Text(ctx, "Transformed timeline drag")
             end
             imgui.TextDisabled(ctx, GetFileName(state.drag_path))
             if state.native_drag_alt_latched then
@@ -30589,10 +30875,10 @@ function Loop()
                 and hover_window ~= "arrange" and hover_window ~= "tcp" then
                 imgui.TextDisabled(ctx, "Sampler/script drop:")
                 imgui.TextDisabled(ctx,
-                    "release, hold Alt, then drag again")
+                    "Release, then start again with the opposite Alt state")
             else
                 imgui.TextDisabled(ctx,
-                    "Alt-drag: samplers and script pads")
+                    "Alt at mouse-down selects the opposite drag type")
             end
             if is_outside and state.drag_kind == "file" then
                 if hover_track then
@@ -30689,8 +30975,8 @@ function Loop()
                 end
                 r.SetEditCurPos(state.drag_orig_cursor_pos, false, false)
             elseif is_outside and state.drag_kind == "file" then
-                local paths = GetSelectedFilePaths(state.drag_path)
-                if state.drag_hover_arrange then
+                local paths = state.drag_paths or GetSelectedFilePaths(state.drag_path)
+                if state.drag_hover_arrange and not state.native_drag_alt_latched then
                     InsertFilesOnConsecutiveTracks(
                         paths,
                         state.drag_last_track,
@@ -30719,6 +31005,8 @@ function Loop()
             state.drag_last_pos = nil
             state.drag_hover_arrange = false
             state.native_drag_alt_latched = false
+            state.drag_paths = nil
+            state.pending_file_drag_paths = nil
         end
     end
 
