@@ -1,5 +1,5 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc9
+-- @version 1.0.0-rc10
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
@@ -9,9 +9,10 @@
 --   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
 --   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Added configurable native external dragging and one-shot drag behavior.
---   Improved folder-row contrast and resizable media preview panels.
---   Updated the native audio preview companion.
+--   Kept file previews playing while dragging and inserting plug-ins.
+--   Stopped FX insertion from raising the FX-chain window over floating plug-ins.
+--   Added precise TCP/MCP FX-slot insertion, preserving empty mixer slots.
+--   Fixed FX-slot insertion on tracks with no existing FX and kept batch order.
 -- @metapackage
 -- @provides
 --   [win64 main] .
@@ -25769,8 +25770,32 @@ function GetFXInstantiatePosition(insert_index)
 end
 
 function ShowAddedTrackFX(track, fx_index, rec_fx, show_chain)
-    r.TrackFX_Show(
-        track, GetTrackFXShowIndex(fx_index, rec_fx), show_chain and 1 or 3)
+    local index = GetTrackFXShowIndex(fx_index, rec_fx)
+    -- Let REAPER finish its chain-window updates before floating the new FX.
+    -- Resolve by GUID because the chain can change before the deferred call.
+    local guid = r.TrackFX_GetFXGUID(track, index)
+    r.defer(function()
+        if not r.ValidatePtr2(0, track, "MediaTrack*") then return end
+        local count = rec_fx and r.TrackFX_GetRecCount(track)
+            or r.TrackFX_GetCount(track)
+        for i = 0, count - 1 do
+            local candidate = GetTrackFXShowIndex(i, rec_fx)
+            if r.TrackFX_GetFXGUID(track, candidate) == guid then
+                r.TrackFX_Show(track, candidate, 3)
+                return
+            end
+        end
+    end)
+end
+
+function GetSelectedTrackFXInsertIndex(track, rec_fx)
+    local get_visible = rec_fx and r.TrackFX_GetRecChainVisible
+        or (not rec_fx and r.TrackFX_GetChainVisible)
+    if not get_visible then return nil end
+    local index = get_visible(track)
+    if index and index >= 0 and (index & 0x2000000) == 0 then
+        return index & 0xFFFFFF
+    end
 end
 
 function ConfigureTrackForInstrumentInput(track)
@@ -25782,12 +25807,39 @@ function ConfigureTrackForInstrumentInput(track)
     r.SetMediaTrackInfo_Value(track, "I_RECMON", 1)
 end
 
-function AddFXToTrack(item, track, rec_fx, show_chain, insert_index)
+function GetTrackFXSlotInsertIndex(track, slot, rec_fx)
+    local count = rec_fx and r.TrackFX_GetRecCount(track)
+        or r.TrackFX_GetCount(track)
+    -- Slot mapping needs an existing chain. The first FX always has chain
+    -- index zero; slot_hint places it in the requested visual mixer slot.
+    if count == 0 then return 0 end
+    if not r.TrackFX_GetNamedConfigParm then return nil end
+    local address = slot + (rec_fx and 0x1000000 or 0)
+    local ok, value = r.TrackFX_GetNamedConfigParm(
+        track, address, "chain_slot_to_index")
+    if not ok then return nil end
+    local index = tonumber(value) or tonumber(tostring(value):match("^empty:(%d+)$"))
+    if not index then return nil end
+    return index & 0xFFFFFF
+end
+
+function GetFXPanelDropSlot(info)
+    return tonumber(tostring(info or ""):match("^[tm]cp%.fxlist%s+(%d+)$"))
+end
+
+function AddFXToTrack(item, track, rec_fx, show_chain, insert_index, insert_slot)
     if not track then
         state.fx_browser.status = "Select a track, then add the plug-in."
         return false
     end
 
+    if insert_slot ~= nil then
+        insert_index = GetTrackFXSlotInsertIndex(track, insert_slot, rec_fx)
+        if insert_index == nil then
+            state.fx_browser.status = "REAPER could not resolve the destination FX slot."
+            return false
+        end
+    end
     r.Undo_BeginBlock()
     local instantiate = GetFXInstantiatePosition(insert_index)
     local fx_index = r.TrackFX_AddByName(
@@ -25797,6 +25849,10 @@ function AddFXToTrack(item, track, rec_fx, show_chain, insert_index)
             track, item.name, rec_fx == true, instantiate)
     end
     if fx_index >= 0 then
+        if insert_slot ~= nil then
+            r.TrackFX_SetNamedConfigParm(track,
+                GetTrackFXShowIndex(fx_index, rec_fx), "slot_hint", tostring(insert_slot))
+        end
         if item.kind == "instrument" and not rec_fx then
             ConfigureTrackForInstrumentInput(track)
         end
@@ -25818,14 +25874,21 @@ function AddFXToTrack(item, track, rec_fx, show_chain, insert_index)
 end
 
 function AddFXToSelectedTrack(item, rec_fx)
-    return AddFXToTrack(item, r.GetSelectedTrack(0, 0), rec_fx)
+    local track = r.GetSelectedTrack(0, 0)
+    local insert_index = track and GetSelectedTrackFXInsertIndex(track, rec_fx)
+    return AddFXToTrack(item, track, rec_fx, false, insert_index)
 end
 
-function AddFXItemsToTrack(items, track, rec_fx, show_chain, insert_index)
+function AddFXItemsToTrack(items, track, rec_fx, show_chain, insert_index, insert_slot)
     if not items or #items == 0 then return false end
+    -- Browser buttons/menus use the chain selection; direct track drops pass
+    -- show_chain=false explicitly and continue to append.
+    if track and show_chain == nil and insert_index == nil then
+        insert_index = GetSelectedTrackFXInsertIndex(track, rec_fx)
+    end
     if #items == 1 then
         return AddFXToTrack(
-            items[1], track, rec_fx, show_chain, insert_index)
+            items[1], track, rec_fx, show_chain, insert_index, insert_slot)
     end
     if not track then
         state.fx_browser.status = "Select a track, then add the plug-ins."
@@ -25837,8 +25900,16 @@ function AddFXItemsToTrack(items, track, rec_fx, show_chain, insert_index)
     local added_instrument = false
     local track_names = {}
     for _, item in ipairs(items) do
+        local slot = insert_slot and (insert_slot + added) or nil
+        local position
+        if slot ~= nil then
+            position = GetTrackFXSlotInsertIndex(track, slot, rec_fx)
+        else
+            position = insert_index and (insert_index + added) or nil
+        end
+        if slot ~= nil and position == nil then break end
         local instantiate = GetFXInstantiatePosition(
-            insert_index and (insert_index + added) or nil)
+            position)
         local fx_index = r.TrackFX_AddByName(
             track, item.ident, rec_fx == true, instantiate)
         if fx_index < 0 and item.name ~= item.ident then
@@ -25846,6 +25917,10 @@ function AddFXItemsToTrack(items, track, rec_fx, show_chain, insert_index)
                 track, item.name, rec_fx == true, instantiate)
         end
         if fx_index >= 0 then
+            if slot ~= nil then
+                r.TrackFX_SetNamedConfigParm(track,
+                    GetTrackFXShowIndex(fx_index, rec_fx), "slot_hint", tostring(slot))
+            end
             added = added + 1
             last_index = fx_index
             added_instrument = added_instrument or item.kind == "instrument"
@@ -26124,14 +26199,19 @@ function GetExplicitFXDropTarget(mouse_x, mouse_y)
     end
 
     local insert_index = nil
+    local insert_slot = GetFXPanelDropSlot(info)
     if fx_address and (fx_address & 0x2000000) == 0 then
         insert_index = fx_address & 0xFFFFFF
+    elseif info == "fx_chain" or window_kind ~= nil or track_point_fx then
+        insert_index = GetSelectedTrackFXInsertIndex(
+            track, kind == "input_fx" or kind == "monitoring_fx")
     end
     return {
         track = track,
         kind = kind,
         explicit_chain = true,
         insert_index = insert_index,
+        insert_slot = insert_slot,
         region = info ~= "" and info or (window_title or "fx_window"),
     }
 end
@@ -26798,7 +26878,7 @@ function DrawFXItemRow(
             fx.drag_pending_item = nil
             fx.drag_pending_row_key = nil
             fx.drag_pending_ctrl = false
-            if state.is_playing then StopPreview() end
+            -- Keep file auditioning active while dragging/adding plug-ins.
         end
     end
     if imgui.BeginPopupContextItem(ctx, "##fx_context_" .. unique_id) then
@@ -28127,7 +28207,7 @@ function ProcessFXDrag()
         elseif target and target.track and drop_kind then
             AddFXItemsToTrack(
                 drag_items, target.track, drop_as_input_fx,
-                target.explicit_chain == true, target.insert_index)
+                target.explicit_chain == true, target.insert_index, target.insert_slot)
         elseif target and target.create_new and outside_browser then
             CreateTrackWithFXItems(drag_items, fx.drag_input_fx)
         elseif outside_browser then
