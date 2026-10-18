@@ -1,5 +1,5 @@
 -- @description ReaBrowse
--- @version 1.0.0-rc10
+-- @version 1.0.0-rc11
 -- @author davvolinni-ui
 -- @links
 --   Support https://forum.cockos.com/showthread.php?p=2958956#post2958956
@@ -9,10 +9,12 @@
 --   Requires Windows x64, REAPER 7.0 or newer, ReaImGui 0.9 or newer,
 --   and the SWS Extension for full arrange-view drag-and-drop support.
 -- @changelog
---   Kept file previews playing while dragging and inserting plug-ins.
---   Stopped FX insertion from raising the FX-chain window over floating plug-ins.
---   Added precise TCP/MCP FX-slot insertion, preserving empty mixer slots.
---   Fixed FX-slot insertion on tracks with no existing FX and kept batch order.
+--   Mirrored native REAPER FX folders, categories, and vendor assignments.
+--   Reloaded native organization through manual Refresh, with no background polling.
+--   Preserved native plugin labels and removed favorites-first FX sorting.
+--   Restored the last selected Media, FX, or Actions tab at startup.
+--   Added a collapsible, resizable FX Favorites panel with saved preferences.
+--   Fixed Random browsing to stay within the selected library folder.
 -- @metapackage
 -- @provides
 --   [win64 main] .
@@ -4453,7 +4455,24 @@ local function BuildCanonicalUnifiedMatchCTE(
         end
     end
 
-    if folder_id then
+    if minimum_random_key_sql and not state.favorites_mode
+        and state.selected_folder_scope and state.selected_folder_scope ~= "" then
+        -- Library selection is authoritative even before its cached database
+        -- folder ID has been hydrated (or after the tree has been rebuilt).
+        ctes[#ctes + 1] = "selected_random_folder(id) AS MATERIALIZED (SELECT "
+            .. "folders.id FROM folders WHERE "
+            .. CanonicalFolderPathPredicate(
+                NormalizeFavoritePath(state.selected_folder_scope))
+            .. " AND folders.missing=0)"
+        ctes[#ctes + 1] = "selected_random_files(file_id) AS MATERIALIZED "
+            .. "(SELECT folder_files.file_id FROM selected_random_folder "
+            .. "JOIN folder_closure ON folder_closure.ancestor_id="
+            .. "selected_random_folder.id JOIN folder_files ON "
+            .. "folder_files.folder_id=folder_closure.descendant_id "
+            .. "WHERE folder_files.missing=0)"
+        where[#where + 1] =
+            "files.id IN(SELECT file_id FROM selected_random_files)"
+    elseif folder_id then
         folder_id = math.max(0, math.floor(tonumber(folder_id) or 0))
         local materialized_scope =
             "scope_files(file_id) AS MATERIALIZED (SELECT folder_files.file_id FROM "
@@ -12567,6 +12586,10 @@ function SaveSettings()
 end
 
 function LoadSettings()
+    local saved_tab = r.GetExtState(EXT_SECTION, "active_main_tab")
+    if saved_tab == "media" or saved_tab == "fx" or saved_tab == "actions" then
+        state.active_main_tab = saved_tab
+    end
     local root_count = math.max(0, math.floor(
         tonumber(r.GetExtState(EXT_SECTION, "root_count")) or 0))
     local numbered_roots = {}
@@ -18612,6 +18635,7 @@ function SetCursorToFolderNode(node, ensure_visible)
             ClearCanonicalFavoriteFolderFacetScope(true)
         end
         browser.collection_scope_key = nil
+        browser.smart_mode = nil
         browser.current_folder_id = node._canonical_folder_id
         browser.current_name = node.name
         browser.current_path = node.path
@@ -18753,9 +18777,8 @@ function PlayFile(filepath)
 end
 
 function GetAllFilesInScope()
-    -- Random browsing follows the folder containing the current file. Merely
-    -- having another library folder open (or previously scoped) must not allow
-    -- Randomize to jump into it.
+    -- An explicitly selected folder owns Random's scope. Fall back to the
+    -- current file's siblings only when no folder scope is selected.
     local current_index = state.visible_index_by_path[state.selected_path or ""]
     local current_item = current_index and state.visible_items[current_index] or nil
     local current_node = current_item and current_item.node or nil
@@ -18789,7 +18812,8 @@ function GetAllFilesInScope()
         return state.random_candidates
     end
 
-    if current_node and current_node.parent then
+    if (not state.selected_folder_scope or state.selected_folder_scope == "")
+        and current_node and current_node.parent then
         local siblings = {}
         for _, file in ipairs(current_node.parent.files or {}) do
             siblings[#siblings + 1] = file
@@ -21257,6 +21281,7 @@ function RevealFileInLibrary(filepath)
     HomeCanonicalBrowser()
     state.canonical_reveal = canonical_reveal
     state.active_main_tab = "media"
+    r.SetExtState(EXT_SECTION, "active_main_tab", "media", true)
     for _, row in ipairs(folder_rows) do
         local node = nodes_by_id[row.id]
         if node then state.open_folders[node.path] = true end
@@ -25331,7 +25356,8 @@ function LoadFXInventoryCache()
         end
         local ident, name = fields[1], fields[2]
         if ident and ident ~= "" and name and name ~= "" then
-            local maker = fields[5] or ""
+            local native_maker, native_category = ResolveFXMetadata(name, ident)
+            local maker = native_maker or ""
             items[#items + 1] = {
                 ident = ident,
                 name = name,
@@ -25341,7 +25367,8 @@ function LoadFXInventoryCache()
                 format = fields[4] ~= "" and fields[4] or "Other",
                 maker = maker,
                 maker_lower = maker:lower(),
-                category = fields[6] ~= "" and fields[6] or "Effects",
+                category = native_category and native_category ~= ""
+                    and native_category or "Uncategorized",
             }
         end
     end
@@ -25364,10 +25391,16 @@ function EachFXStateRecord(value, callback)
     for record in value:sub(4):gmatch("[^;]+") do callback(record) end
 end
 
-function LoadREAPERFXMetadata()
+function LoadREAPERFXMetadata(force)
+    RefreshNativeFXFolders()
     local fx = state.fx_browser
-    if fx.metadata_loaded then return end
-    fx.metadata_loaded = true
+    if fx.metadata_loaded and not force then return end
+    fx.metadata_developer = {}
+    fx.metadata_developer_overrides = {}
+    fx.metadata_category = {}
+    fx.metadata_category_overrides = {}
+    fx.metadata_display_key = {}
+    fx.recent_names = {}
 
     local resource = r.GetResourcePath()
     local tags = io.open(resource .. "/reaper-fxtags.ini", "r")
@@ -25392,6 +25425,25 @@ function LoadREAPERFXMetadata()
         tags:close()
     end
 
+    local overrides = io.open(resource .. "/reaper-fxfolders.ini", "r")
+    if overrides then
+        local section = ""
+        for line in overrides:lines() do
+            local header = line:match("^%[([^]]+)%]$")
+            if header then
+                section = header:lower()
+            elseif section == "category" or section == "developer" then
+                local key, value = line:match("^([^=]+)=(.*)$")
+                if key then
+                    local target = section == "category"
+                        and fx.metadata_category_overrides or fx.metadata_developer_overrides
+                    target[key:lower()] = value
+                end
+            end
+        end
+        overrides:close()
+    end
+
     local vst_cache = io.open(resource .. "/reaper-vstplugins64.ini", "r")
     if vst_cache then
         local in_cache = false
@@ -25406,6 +25458,10 @@ function LoadREAPERFXMetadata()
                     if display then
                         fx.metadata_display_key[
                             NormalizeFXMetadataName(display)] = key:lower()
+                        local format = key:lower():find(".vst3", 1, true)
+                            and "vst3" or "vst"
+                        fx.metadata_display_key[NormalizeFXMetadataName(display)
+                            .. "|" .. format] = key:lower()
                     end
                 end
             end
@@ -25424,6 +25480,8 @@ function LoadREAPERFXMetadata()
         recent:close()
     end
 
+    if fx.metadata_loaded then return end
+    fx.metadata_loaded = true
     local saved_folders = r.GetExtState(EXT_SECTION, "FXFavoriteFolders")
     EachFXStateRecord(saved_folders, function(record)
         local path = DecodeFXStateField(record)
@@ -25550,6 +25608,8 @@ function SaveFXBrowserPreferences()
     r.SetExtState(EXT_SECTION, "FXTypeFilter", fx.type_filter, true)
     r.SetExtState(EXT_SECTION, "FXViewMode", fx.view_mode, true)
     r.SetExtState(EXT_SECTION, "FXSortMode", fx.sort_mode, true)
+    r.SetExtState(EXT_SECTION, "FXFavoritesOpen", tostring(fx.favorites_open ~= false), true)
+    r.SetExtState(EXT_SECTION, "FXFavoritesHeight", tostring(fx.favorites_height or 180), true)
     local enabled = {}
     for format, value in pairs(fx.format_enabled) do
         if value then enabled[#enabled + 1] = format end
@@ -25561,6 +25621,10 @@ end
 
 LoadFXBrowserPreferences = function()
     local fx = state.fx_browser
+    fx.favorites_open = r.GetExtState(EXT_SECTION, "FXFavoritesOpen") ~= "false"
+    local favorites_height = tonumber(r.GetExtState(EXT_SECTION, "FXFavoritesHeight"))
+    fx.favorites_height = favorites_height and favorites_height == favorites_height
+        and math.max(40, math.min(2000, favorites_height)) or 180
     local type_filter = r.GetExtState(EXT_SECTION, "FXTypeFilter")
     if type_filter == "all" or type_filter == "instrument"
         or type_filter == "effect" then
@@ -25590,15 +25654,27 @@ function ResolveFXMetadata(name, ident)
     keys[#keys + 1] = ident_lower
     keys[#keys + 1] = ident_lower:gsub("^[^:]+:%s*", "")
     keys[#keys + 1] = ident_lower:match("([^/\\]+)$") or ""
-    local display_key =
-        fx.metadata_display_key[NormalizeFXMetadataName(name)]
+    local format = (name or ""):match("^([%w]+):") or ""
+    format = format:lower():gsub("i$", "")
+    local normalized_name = NormalizeFXMetadataName(name)
+    local display_key = fx.metadata_display_key[normalized_name .. "|" .. format]
+        or fx.metadata_display_key[normalized_name]
     if display_key then keys[#keys + 1] = display_key end
 
     local developer, category = nil, nil
+    -- User assignments take precedence across all identifier aliases.
+    for _, key in ipairs(keys) do
+        local override = (fx.metadata_category_overrides or {})[key]
+        if override ~= nil then category = override break end
+    end
+    for _, key in ipairs(keys) do
+        local override = (fx.metadata_developer_overrides or {})[key]
+        if override ~= nil then developer = override break end
+    end
     for _, key in ipairs(keys) do
         if key ~= "" then
-            developer = developer or fx.metadata_developer[key]
-            category = category or fx.metadata_category[key]
+            if developer == nil then developer = fx.metadata_developer[key] end
+            if category == nil then category = fx.metadata_category[key] end
         end
     end
     return developer, category
@@ -25606,7 +25682,7 @@ end
 
 function StartFXScan()
     local fx = state.fx_browser
-    LoadREAPERFXMetadata()
+    LoadREAPERFXMetadata(true)
     -- REAPER 7.42+ requires EnumInstalledFX(-1) to re-read JSFX metadata
     -- before enumerating. Without this, a newly added JSFX can appear in
     -- REAPER's FX browser but remain absent from ReaBrowse's inventory.
@@ -25648,19 +25724,10 @@ function ProcessFXScan()
         name = name or ident or ("Plug-in " .. tostring(fx.scan_index + 1))
         ident = ident or name
         local kind, format = ClassifyInstalledFX(name, ident)
-        local maker = name:match("%(([^()]*)%)%s*$") or ""
-        if maker:lower() == "x64" or maker:lower() == "x86"
-            or maker:lower() == "64-bit" or maker:lower() == "32-bit" then
-            maker = ""
-        end
         local metadata_maker, category = ResolveFXMetadata(name, ident)
-        if metadata_maker and metadata_maker ~= "" then maker = metadata_maker end
-        if category and maker ~= ""
-            and category:lower() == maker:lower() then
-            category = nil
-        end
+        local maker = metadata_maker or ""
         if not category or category == "" then
-            category = kind == "instrument" and "Instruments" or "Effects"
+            category = "Uncategorized"
         end
         fx.items[#fx.items + 1] = {
             name = name,
@@ -25722,9 +25789,6 @@ function UpdateFXFilter()
     end
 
     table.sort(results, function(a, b)
-        local a_favorite = fx.favorites[a.ident] ~= nil
-        local b_favorite = fx.favorites[b.ident] ~= nil
-        if a_favorite ~= b_favorite then return a_favorite end
         if fx.sort_mode == "name_za" then
             return a.name_lower > b.name_lower
         elseif fx.sort_mode == "maker" then
@@ -26760,10 +26824,9 @@ function DrawFXItemRow(
     local selected = fx.selected_idents[item.ident] == true
         and (not fx.selected_row_keys[item.ident]
             or fx.selected_row_keys[item.ident] == unique_id)
-    local display_name = item.name:gsub("^[^:]+:%s*", "")
-    local format_label = tostring(item.format or ""):upper()
-    if format_label == "" then format_label = "OTHER" end
-    local display_label = "[" .. format_label .. "]  " .. display_name
+    -- Keep REAPER's complete label, including VSTi/VST3i instrument prefixes.
+    -- The displayed name now matches the name used for alphabetical sorting.
+    local display_label = item.name
     local is_favorite = fx.favorites[item.ident] ~= nil
     -- FX rows use the exact media-row primitive and gutter geometry. The
     -- SpanAllWidth leaf keeps selection/hover color across the full row while
@@ -27015,14 +27078,22 @@ function BuildFXGroups(items, mode)
     for _, item in ipairs(items) do
         local group_names = {}
         if mode == "vendor" then
-            group_names[1] = item.maker ~= "" and item.maker or "Unknown Vendor"
-        elseif item.kind == "instrument" then
-            group_names[1] = InferInstrumentFamily(item)
+            for developer in (item.maker or ""):gmatch("[^|]+") do
+                developer = developer:match("^%s*(.-)%s*$")
+                if developer ~= "" then
+                    local duplicate = false
+                    for _, existing in ipairs(group_names) do
+                        if existing == developer then duplicate = true break end
+                    end
+                    if not duplicate then group_names[#group_names + 1] = developer end
+                end
+            end
+            if #group_names == 0 then group_names[1] = "Unknown Vendor" end
         else
             for category in (item.category or "Uncategorized"):gmatch("[^|]+") do
                 category = category:match("^%s*(.-)%s*$")
                 if category ~= "" then
-                    local refined = RefineEffectCategory(category, item)
+                    local refined = category
                     local duplicate = false
                     for _, existing in ipairs(group_names) do
                         if existing == refined then duplicate = true break end
@@ -27030,7 +27101,7 @@ function BuildFXGroups(items, mode)
                     if not duplicate then group_names[#group_names + 1] = refined end
                 end
             end
-            if #group_names == 0 then group_names[1] = "Other Effects" end
+            if #group_names == 0 then group_names[1] = "Uncategorized" end
         end
         for _, group_name in ipairs(group_names) do
             if not by_name[group_name] then by_name[group_name] = {} end
@@ -27622,7 +27693,7 @@ end
 -- Keep this large optional FX section out of the main chunk's local-variable
 -- budget. Lua limits locals in the top-level chunk to 200; the function's
 -- internal locals remain private to its own scope.
-function DrawFXLibraryRoots()
+function DrawFXFavoritesPanel(footer_h)
     local fx = state.fx_browser
 
     imgui.Spacing(ctx)
@@ -27631,8 +27702,13 @@ function DrawFXLibraryRoots()
         OpenFXFolderDialog("create_favorite", "", nil)
     end
     imgui.Separator(ctx)
+    imgui.SetNextItemOpen(ctx, fx.favorites_open ~= false, imgui.Cond_Always)
     local favorites_open = DrawBrowserFolderTreeNode(
         "♥  Favorites##fx_favorites_root", FLG_SPAN_WIDTH, false)
+    if favorites_open ~= (fx.favorites_open ~= false) then
+        fx.favorites_open = favorites_open
+        SaveFXBrowserPreferences()
+    end
     if fx.drag_active and IsMouseInsideLastItem() then
         fx.favorite_drop_active = true
         fx.favorite_drop_target = ""
@@ -27644,26 +27720,178 @@ function DrawFXLibraryRoots()
         imgui.EndPopup(ctx)
     end
     if favorites_open then
-        local favorite_cache = GetFXFavoriteViewCache()
-        local roots = favorite_cache.children[""] or {}
-        for _, path in ipairs(roots) do
-            DrawFavoriteFXFolder(path, path, 0, favorite_cache)
-        end
-        local favorite_root_items = favorite_cache.root_items
-        local favorite_root_row_keys = GetFXRowKeyMap(
-            "favorite:root", favorite_root_items,
-            "favorite_root_", true)
-        for _, item in ipairs(favorite_root_items) do
-            DrawFXItemRow(
-                item, favorite_root_row_keys[item.ident],
-                favorite_root_items, "", true, favorite_root_row_keys)
-        end
-        if #roots == 0 and #favorite_root_items == 0 then
-            imgui.TextDisabled(ctx,
-                "No favorites yet. Click a heart or drag a plug-in here.")
-        end
         imgui.TreePop(ctx)
+        local _, available_h = imgui.GetContentRegionAvail(ctx)
+        -- Reserve room for the normal browser, footer, and divider spacing.
+        local maximum = math.max(1, available_h - footer_h - 100)
+        local minimum = math.min(40, maximum)
+        local height = math.max(minimum, math.min(maximum, fx.favorites_height or 180))
+        local visible = imgui.BeginChild(ctx, "##fx_favorites_panel", 0, height, FLG_CHILD_BORDER)
+        if visible then
+            local favorite_cache = GetFXFavoriteViewCache()
+            local roots = favorite_cache.children[""] or {}
+            for _, path in ipairs(roots) do
+                DrawFavoriteFXFolder(path, path, 0, favorite_cache)
+            end
+            local favorite_root_items = favorite_cache.root_items
+            local favorite_root_row_keys = GetFXRowKeyMap(
+                "favorite:root", favorite_root_items,
+                "favorite_root_", true)
+            for _, item in ipairs(favorite_root_items) do
+                DrawFXItemRow(
+                    item, favorite_root_row_keys[item.ident],
+                    favorite_root_items, "", true, favorite_root_row_keys)
+            end
+            if #roots == 0 and #favorite_root_items == 0 then
+                imgui.TextDisabled(ctx,
+                    "No favorites yet. Click a heart or drag a plug-in here.")
+            end
+        end
+        imgui.EndChild(ctx)
+        imgui.Button(ctx, "##fx_favorites_divider", -1, 5)
+        local active = imgui.IsItemActive(ctx)
+        local hovered = imgui.IsItemHovered(ctx)
+        local x1, y1 = imgui.GetItemRectMin(ctx)
+        local x2, y2 = imgui.GetItemRectMax(ctx)
+        local center_x, center_y = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        local colors = state.resolved_theme or state.theme.colors
+        local grip_color = (hovered or active) and colors.accent
+            or ((colors.text & 0xFFFFFF00) | 0xB0)
+        local grip_half = math.min(18, (x2 - x1) * 0.25)
+        local draw = imgui.GetWindowDrawList(ctx)
+        for offset = -1, 1, 2 do
+            imgui.DrawList_AddLine(draw,
+                center_x - grip_half, center_y + offset,
+                center_x + grip_half, center_y + offset, grip_color, 1.5)
+        end
+        if active then
+            local _, mouse_y = imgui.GetMousePos(ctx)
+            if not fx.favorites_resize then
+                fx.favorites_resize = {y = mouse_y, height = height}
+            end
+            fx.favorites_height = math.max(minimum, math.min(maximum,
+                fx.favorites_resize.height + mouse_y - fx.favorites_resize.y))
+        elseif fx.favorites_resize then
+            fx.favorites_resize = nil
+            SaveFXBrowserPreferences()
+        end
+        if active or hovered then
+            imgui.SetMouseCursor(ctx, imgui.MouseCursor_ResizeNS)
+            if not active then imgui.SetTooltip(ctx, "Drag to resize Favorites") end
+        end
     end
+end
+
+-- Native folders are read-only here: REAPER remains their source of truth.
+function ParseNativeFXFolders(text)
+    local sections, section = {}, nil
+    for line in text:gmatch("[^\r\n]+") do
+        local header = line:match("^%[([^]]+)%]%s*$")
+        if header then
+            section = {}
+            sections[header] = section
+        elseif section then
+            local key, value = line:match("^([^=]+)=(.*)$")
+            if key then section[key] = value end
+        end
+    end
+    local index, folders = sections.Folders or {}, {}
+    for n = 0, (tonumber(index.NbFolders) or 0) - 1 do
+        local id = index["Id" .. n] or tostring(n)
+        local data = sections["Folder" .. id] or {}
+        local folder = {id = id, name = index["Name" .. n] or ("Folder " .. id), entries = {}}
+        for i = 0, (tonumber(data.Nb) or 0) - 1 do
+            if data["Item" .. i] then
+                folder.entries[#folder.entries + 1] = {
+                    ident = data["Item" .. i], type = tonumber(data["Type" .. i])}
+            end
+        end
+        folders[#folders + 1] = folder
+    end
+    return folders
+end
+
+function NativeFXIdentity(value)
+    local key = (value or ""):gsub("\\", "/"):lower()
+    key = key:gsub("^js:%s*", ""):gsub("^vst3?:%s*", "")
+    -- VST3 bundles may be recorded as their bundle or inner binary path.
+    return key:match("^(.-%.vst3)/contents/.*$") or key
+end
+
+function RefreshNativeFXFolders()
+    local fx = state.fx_browser
+    local file = io.open(r.GetResourcePath() .. "/reaper-fxfolders.ini", "rb")
+    if not file then return end
+    local text = file:read("*a")
+    file:close()
+    if text ~= fx.native_folders_source then
+        fx.native_folders_source = text
+        fx.native_folders = ParseNativeFXFolders(text)
+    end
+end
+
+function DrawNativeFXFolders()
+    local fx = state.fx_browser
+    local folders = fx.native_folders or {}
+    if #folders == 0 then return end
+    local open = DrawBrowserFolderTreeNode(
+        "REAPER FX Folders##native_fx_root", FLG_SPAN_WIDTH, false)
+    if not open then return end
+    -- Match exact normalized identities first. A basename fallback is allowed
+    -- only when unique, so similarly named plug-ins cannot silently collide.
+    if fx.native_inventory_generation ~= fx.generation then
+        local exact, base = {}, {}
+        for _, item in ipairs(fx.items) do
+            local key = NativeFXIdentity(item.ident)
+            exact[key] = item
+            local name = key:match("([^/]+)$") or key
+            if base[name] == nil then base[name] = item else base[name] = false end
+        end
+        fx.native_exact, fx.native_base = exact, base
+        fx.native_inventory_generation = fx.generation
+    end
+    local visible = {}
+    for _, item in ipairs(fx.filtered_items) do visible[item.ident] = true end
+    for _, folder in ipairs(folders) do
+        local items, seen, unsupported, missing = {}, {}, false, 0
+        for _, entry in ipairs(folder.entries) do
+            if entry.type == 1048576 then
+                unsupported = true
+            else
+                local key = NativeFXIdentity(entry.ident)
+                local item = fx.native_exact[key]
+                    or fx.native_base[key:match("([^/]+)$") or key]
+                if not item then missing = missing + 1 end
+                if item and visible[item.ident] and not seen[item.ident] then
+                    seen[item.ident] = true
+                    items[#items + 1] = item
+                end
+            end
+        end
+        local expanded = DrawBrowserFolderTreeNode(
+            folder.name .. "##native_fx_folder_" .. folder.id, FLG_SPAN_WIDTH, false)
+        if expanded then
+            local keys = GetFXRowKeyMap("native:" .. folder.id, items,
+                "native_" .. folder.id .. "_", false)
+            for _, item in ipairs(items) do
+                DrawFXItemRow(item, keys[item.ident], items, nil, true, keys)
+            end
+            if unsupported then imgui.TextDisabled(ctx, "Smart folder rules are not supported yet.") end
+            if missing > 0 then imgui.TextDisabled(ctx,
+                tostring(missing) .. " native entries could not be matched.") end
+            if #items == 0 and not unsupported and missing == 0 then
+                imgui.TextDisabled(ctx, "No plug-ins match the current filters.")
+            end
+            imgui.TreePop(ctx)
+        end
+    end
+    imgui.TreePop(ctx)
+end
+
+function DrawFXLibraryRoots()
+    local fx = state.fx_browser
+
+    DrawNativeFXFolders()
 
     DrawFXUsageRoot("recent", "Recent")
     DrawFXUsageRoot("used", "Most Used")
@@ -27947,14 +28175,15 @@ function DrawFXBrowser()
 
         imgui.Separator(ctx)
 
-        local _, remaining_h = imgui.GetContentRegionAvail(ctx)
         local footer_h = 34
+        fx.favorite_drop_active = false
+        fx.favorite_drop_target = ""
+        DrawFXFavoritesPanel(footer_h)
+        local _, remaining_h = imgui.GetContentRegionAvail(ctx)
         local list_visible = imgui.BeginChild(
             ctx, "##fx_list", 0, math.max(80, remaining_h - footer_h),
             FLG_CHILD_BORDER)
         if list_visible then
-            fx.favorite_drop_active = false
-            fx.favorite_drop_target = ""
             DrawFXLibraryRoots()
             local has_search = fx.search:match("%S") ~= nil
             if has_search then
@@ -30214,6 +30443,7 @@ function DrawMainTabs()
         if imgui.Button(ctx, "##" .. id,
             navigation_button_width, 36) then
             state.active_main_tab = tab
+            r.SetExtState(EXT_SECTION, "active_main_tab", tab, true)
         end
         local min_x, min_y = imgui.GetItemRectMin(ctx)
         local max_x, max_y = imgui.GetItemRectMax(ctx)
